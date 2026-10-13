@@ -11,17 +11,17 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
     private string? _sessionToken;
     private DateTimeOffset _sessionExpiry;
 
-    public async Task<string> GetSessionTokenAsync(CancellationToken cancellationToken)
+    public async Task<string> GetSessionTokenAsync(CancellationToken cancellationToken, bool forceLogin = false)
     {
         await _authenticationLock.WaitAsync(cancellationToken);
         try
         {
-            if (!string.IsNullOrEmpty(_sessionToken) && _sessionExpiry > DateTimeOffset.UtcNow.AddMinutes(10))
+            if (!forceLogin && !string.IsNullOrEmpty(_sessionToken) && _sessionExpiry > DateTimeOffset.UtcNow.AddMinutes(10))
             {
                 return _sessionToken;
             }
 
-            if (!string.IsNullOrEmpty(_sessionToken))
+            if (!forceLogin && !string.IsNullOrEmpty(_sessionToken))
             {
                 try
                 {
@@ -193,7 +193,8 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
         }
         catch (UnauthorizedAccessException)
         {
-            token = await GetSessionTokenAsync(cancellationToken);
+            var rejectedCurrentToken = await InvalidateSessionTokenAsync(token, cancellationToken);
+            token = await GetSessionTokenAsync(cancellationToken, rejectedCurrentToken);
             response = await PostUnauthenticatedAsync<T>(path, payload, token, cancellationToken);
         }
 
@@ -225,13 +226,31 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
         using var response = await httpClient.SendAsync(request, cancellationToken);
         if (response.StatusCode == HttpStatusCode.Unauthorized)
         {
-            _sessionToken = null;
-            _sessionExpiry = default;
             throw new UnauthorizedAccessException("Topstep session token expired or was rejected.");
         }
 
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<T>(cancellationToken: cancellationToken)
                ?? throw new InvalidOperationException($"Topstep {path} returned an empty response.");
+    }
+
+    private async Task<bool> InvalidateSessionTokenAsync(string rejectedToken, CancellationToken cancellationToken)
+    {
+        await _authenticationLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (!string.Equals(_sessionToken, rejectedToken, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _sessionToken = null;
+            _sessionExpiry = default;
+            return true;
+        }
+        finally
+        {
+            _authenticationLock.Release();
+        }
     }
 }
