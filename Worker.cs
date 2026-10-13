@@ -150,7 +150,7 @@ public sealed class Worker(
             return;
         }
 
-        var latestCompletedCandle = _candles
+        var unseenCompletedCandles = _candles
             .Where(candle =>
             {
                 var time = MarketTime.ToEastern(candle.T);
@@ -158,26 +158,25 @@ public sealed class Worker(
                        time.TimeOfDay >= new TimeSpan(9, 45, 0) &&
                        time <= easternNow.AddMinutes(-1);
             })
-            .OrderByDescending(candle => candle.T)
-            .FirstOrDefault();
+            .Where(candle => _session.LastEntryCandle is null || candle.T > _session.LastEntryCandle)
+            .OrderBy(candle => candle.T)
+            .ToArray();
 
-        if (latestCompletedCandle is null || _session.LastEntryCandle >= latestCompletedCandle.T)
+        foreach (var candle in unseenCompletedCandles)
         {
-            return;
-        }
+            _session.LastEntryCandle = candle.T;
+            if (easternNow - MarketTime.ToEastern(candle.T) > TimeSpan.FromMinutes(2))
+            {
+                await journal.WriteAsync($"entry-skipped:stale-breakout-candle={candle.T:O}", cancellationToken);
+                continue;
+            }
 
-        _session.LastEntryCandle = latestCompletedCandle.T;
-        if (easternNow - MarketTime.ToEastern(latestCompletedCandle.T) > TimeSpan.FromMinutes(2))
-        {
-            await journal.WriteAsync($"entry-skipped:stale-breakout-candle={latestCompletedCandle.T:O}", cancellationToken);
-            await sessionStore.SaveAsync(_session, cancellationToken);
-            return;
-        }
-
-        var direction = strategy.GetBreakout(latestCompletedCandle, _openingRange);
-        if (direction is not null)
-        {
-            await SubmitEntryAsync(direction.Value, latestCompletedCandle, tradingDate, cancellationToken);
+            var direction = strategy.GetBreakout(candle, _openingRange);
+            if (direction is not null)
+            {
+                await SubmitEntryAsync(direction.Value, candle, tradingDate, cancellationToken);
+                break;
+            }
         }
 
         await sessionStore.SaveAsync(_session, cancellationToken);
@@ -233,11 +232,22 @@ public sealed class Worker(
             return;
         }
 
-        if (marketData.LastQuote is not { LastPrice: > 0 } quote ||
-            !await ConfirmExistingStopAsync(_session.Trade, cancellationToken) ||
-            !strategy.IsValidProtectiveStop(_session.Trade, _session.Trade.ConfirmedStop!.Value, quote.LastPrice))
+        if (!await ConfirmExistingStopAsync(_session.Trade, cancellationToken))
         {
             await ClosePositionAsync("unprotected-recovered-position", cancellationToken);
+            return;
+        }
+
+        if (marketData.LastQuote is not { LastPrice: > 0 } quote)
+        {
+            await journal.WriteAsync("recovered-position:waiting-for-market-quote", cancellationToken);
+            await sessionStore.SaveAsync(_session, cancellationToken);
+            return;
+        }
+
+        if (!strategy.IsValidProtectiveStop(_session.Trade, _session.Trade.ConfirmedStop!.Value, quote.LastPrice))
+        {
+            await ClosePositionAsync("recovered-stop-crossed-before-confirmation", cancellationToken);
             return;
         }
 
