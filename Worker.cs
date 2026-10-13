@@ -525,6 +525,23 @@ public sealed class Worker(
         {
             await topstep.ClosePositionAsync(_account.Id, _contract.Id, cancellationToken);
             await journal.WriteAsync($"position-close-submitted:{reason}", cancellationToken);
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+            var start = MarketTime.ToUtc(_session?.TradingDate ?? DateOnly.FromDateTime(MarketTime.ToEastern(DateTimeOffset.UtcNow).Date), new TimeOnly(9, 30));
+            var executions = (await topstep.GetTradesAsync(_account.Id, start, DateTimeOffset.UtcNow, cancellationToken))
+                .Where(trade => trade.ContractId == _contract.Id)
+                .OrderBy(trade => trade.CreationTimestamp);
+            foreach (var execution in executions)
+            {
+                var expectedStop = _session?.Trade?.ConfirmedStop;
+                var stopSlippage = expectedStop is null || execution.Side == (_session?.Trade?.Direction == TradeDirection.Long ? 0 : 1)
+                    ? (decimal?)null
+                    : _session!.Trade!.Direction == TradeDirection.Long
+                        ? expectedStop.Value - execution.Price
+                        : execution.Price - expectedStop.Value;
+                await journal.WriteAsync(
+                    $"actual-execution:order={execution.OrderId}; side={execution.Side}; size={execution.Size}; price={execution.Price}; fees={execution.Fees}; pnl={execution.ProfitAndLoss}; theoretical-stop={expectedStop}; stop-slippage={stopSlippage}",
+                    cancellationToken);
+            }
         }
         catch (Exception exception)
         {

@@ -118,6 +118,24 @@ public sealed class TopstepPosition
     public decimal AveragePrice { get; init; }
 }
 
+public sealed class TradesResponse : ApiResponse
+{
+    public List<TopstepTrade> Trades { get; init; } = [];
+}
+
+public sealed class TopstepTrade
+{
+    public long Id { get; init; }
+    public string ContractId { get; init; } = string.Empty;
+    public DateTimeOffset CreationTimestamp { get; init; }
+    public decimal Price { get; init; }
+    public decimal? ProfitAndLoss { get; init; }
+    public decimal Fees { get; init; }
+    public int Side { get; init; }
+    public int Size { get; init; }
+    public long OrderId { get; init; }
+}
+
 public sealed class Quote
 {
     public string Symbol { get; init; } = string.Empty;

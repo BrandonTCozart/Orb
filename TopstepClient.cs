@@ -23,13 +23,21 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
 
             if (!string.IsNullOrEmpty(_sessionToken))
             {
-                var validated = await PostUnauthenticatedAsync<ValidateResponse>(
-                    "/api/Auth/validate", new { }, _sessionToken, cancellationToken);
-                if (validated.Success && !string.IsNullOrWhiteSpace(validated.NewToken))
+                try
                 {
-                    _sessionToken = validated.NewToken;
-                    _sessionExpiry = DateTimeOffset.UtcNow.AddHours(23);
-                    return _sessionToken;
+                    var validated = await PostUnauthenticatedAsync<ValidateResponse>(
+                        "/api/Auth/validate", new { }, _sessionToken, cancellationToken);
+                    if (validated.Success && !string.IsNullOrWhiteSpace(validated.NewToken))
+                    {
+                        _sessionToken = validated.NewToken;
+                        _sessionExpiry = DateTimeOffset.UtcNow.AddHours(23);
+                        return _sessionToken;
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    _sessionToken = null;
+                    _sessionExpiry = default;
                 }
             }
 
@@ -160,6 +168,19 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
 
     public Task<ApiResponse> ClosePositionAsync(int accountId, string contractId, CancellationToken cancellationToken) =>
         PostAsync<ApiResponse>("/api/Position/closeContract", new { accountId, contractId }, cancellationToken);
+
+    public async Task<IReadOnlyList<TopstepTrade>> GetTradesAsync(
+        int accountId,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        CancellationToken cancellationToken)
+    {
+        var result = await PostAsync<TradesResponse>(
+            "/api/Trade/search",
+            new { accountId, startTimestamp = start, endTimestamp = end },
+            cancellationToken);
+        return result.Trades;
+    }
 
     private async Task<T> PostAsync<T>(string path, object payload, CancellationToken cancellationToken)
         where T : ApiResponse
