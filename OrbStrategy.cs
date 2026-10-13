@@ -42,8 +42,15 @@ public sealed class OrbStrategy
             .FirstOrDefault();
 
         return (
-            intradayBars.Length == 0 ? null : intradayBars.Max(candle => candle.H),
-            previousRth is null ? null : previousRth.Max(item => item.Candle.H));
+            HasCompleteMinuteCoverage(intradayBars, premarketStart, marketOpen)
+                ? intradayBars.Max(candle => candle.H)
+                : null,
+            previousRth is not null && HasCompleteMinuteCoverage(
+                previousRth.Select(item => item.Candle),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(9, 30))),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(16, 0))))
+                ? previousRth.Max(item => item.Candle.H)
+                : null);
     }
 
     public (decimal? Intraday, decimal? PreviousDay) GetShortReferenceLevels(IEnumerable<Candle> candles, DateOnly tradingDate)
@@ -67,8 +74,15 @@ public sealed class OrbStrategy
             .FirstOrDefault();
 
         return (
-            intradayBars.Length == 0 ? null : intradayBars.Min(candle => candle.L),
-            previousRth is null ? null : previousRth.Min(item => item.Candle.L));
+            HasCompleteMinuteCoverage(intradayBars, premarketStart, marketOpen)
+                ? intradayBars.Min(candle => candle.L)
+                : null,
+            previousRth is not null && HasCompleteMinuteCoverage(
+                previousRth.Select(item => item.Candle),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(9, 30))),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(16, 0))))
+                ? previousRth.Min(item => item.Candle.L)
+                : null);
     }
 
     public TradeDirection? GetBreakout(Candle candle, OpeningRange openingRange) =>
@@ -263,13 +277,20 @@ public sealed class OrbStrategy
             .Where(gap => trade.Direction == TradeDirection.Long
                 ? gap.Lower >= boundary && gap.Upper <= reference
                 : gap.Upper <= boundary && gap.Lower >= reference)
-            .OrderByDescending(gap => gap.Width)
+            .Select(gap => new
+            {
+                Gap = gap,
+                Stop = RoundStop(trade.Direction, trade.Direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize)
+            })
+            .Where(candidate => GetProfit(trade, candidate.Stop) > 0 &&
+                                IsMoreProtective(
+                                    trade.Direction,
+                                    candidate.Stop,
+                                    trade.ConfirmedStop ?? trade.InitialStop))
+            .OrderByDescending(candidate => candidate.Gap.Width)
             .ToArray();
 
-        var gap = candidates.FirstOrDefault();
-        return gap is null
-            ? null
-            : RoundStop(trade.Direction, trade.Direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize);
+        return candidates.FirstOrDefault()?.Stop;
     }
 
     private decimal? FindInitialFvgStop(
@@ -326,6 +347,26 @@ public sealed class OrbStrategy
             if (third.L > first.H)
             {
                 yield return new FairValueGap { Bullish = true, Lower = first.H, Upper = third.L, CreatedAt = third.T };
+            }
+
+            private static bool HasCompleteMinuteCoverage(
+                IEnumerable<Candle> candles,
+                DateTimeOffset start,
+                DateTimeOffset end)
+            {
+                var minutes = candles
+                    .Select(candle => MarketTime.ToEastern(candle.T))
+                    .Select(time => new DateTimeOffset(time.Year, time.Month, time.Day, time.Hour, time.Minute, 0, time.Offset))
+                    .Distinct()
+                    .OrderBy(time => time)
+                    .ToArray();
+
+                var expectedMinutes = (int)(end - start).TotalMinutes;
+                return minutes.Length == expectedMinutes &&
+                       minutes.Length > 0 &&
+                       minutes[0] == start &&
+                       minutes[^1] == end.AddMinutes(-1) &&
+                       minutes.Zip(minutes.Skip(1), (first, second) => second - first).All(span => span == TimeSpan.FromMinutes(1));
             }
             else if (third.H < first.L)
             {

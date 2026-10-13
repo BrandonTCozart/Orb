@@ -75,7 +75,13 @@ public sealed class Worker(
                 return;
             }
 
-            if (easternNow.TimeOfDay < new TimeSpan(9, 45, 0) || !IsNewHistoryMinute(easternNow))
+            if (easternNow.TimeOfDay < new TimeSpan(9, 45, 0))
+            {
+                await CloseOpenContractPositionAsync("position-outside-trading-window", cancellationToken);
+                return;
+            }
+
+            if (!IsNewHistoryMinute(easternNow))
             {
                 return;
             }
@@ -144,26 +150,34 @@ public sealed class Worker(
             return;
         }
 
-        var closedBars = _candles
+        var latestCompletedCandle = _candles
             .Where(candle =>
             {
                 var time = MarketTime.ToEastern(candle.T);
                 return DateOnly.FromDateTime(time.Date) == tradingDate &&
-                       time.TimeOfDay >= new TimeSpan(9, 45, 0);
+                       time.TimeOfDay >= new TimeSpan(9, 45, 0) &&
+                       time <= easternNow.AddMinutes(-1);
             })
-            .Where(candle => _session.LastEntryCandle is null || candle.T > _session.LastEntryCandle)
-            .OrderBy(candle => candle.T)
-            .ToArray();
+            .OrderByDescending(candle => candle.T)
+            .FirstOrDefault();
 
-        foreach (var candle in closedBars)
+        if (latestCompletedCandle is null || _session.LastEntryCandle >= latestCompletedCandle.T)
         {
-            _session.LastEntryCandle = candle.T;
-            var direction = strategy.GetBreakout(candle, _openingRange);
-            if (direction is not null)
-            {
-                await SubmitEntryAsync(direction.Value, candle, tradingDate, cancellationToken);
-                break;
-            }
+            return;
+        }
+
+        _session.LastEntryCandle = latestCompletedCandle.T;
+        if (easternNow - MarketTime.ToEastern(latestCompletedCandle.T) > TimeSpan.FromMinutes(2))
+        {
+            await journal.WriteAsync($"entry-skipped:stale-breakout-candle={latestCompletedCandle.T:O}", cancellationToken);
+            await sessionStore.SaveAsync(_session, cancellationToken);
+            return;
+        }
+
+        var direction = strategy.GetBreakout(latestCompletedCandle, _openingRange);
+        if (direction is not null)
+        {
+            await SubmitEntryAsync(direction.Value, latestCompletedCandle, tradingDate, cancellationToken);
         }
 
         await sessionStore.SaveAsync(_session, cancellationToken);
@@ -176,8 +190,16 @@ public sealed class Worker(
             return;
         }
 
-        var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-            .SingleOrDefault(item => item.ContractId == _contract.Id);
+        var positions = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+            .Where(item => item.ContractId == _contract.Id)
+            .ToArray();
+        if (positions.Length > 1)
+        {
+            await ClosePositionAsync("multiple-open-contract-positions", cancellationToken);
+            return;
+        }
+
+        var position = positions.SingleOrDefault();
 
         if (_session.Trade is null)
         {
@@ -189,20 +211,37 @@ public sealed class Worker(
                     return;
                 }
 
-                _session.TradeSubmitted = true;
-                await journal.WriteAsync($"open-unmanaged-position:size={position.Size}; entry disabled for today", cancellationToken);
-                await sessionStore.SaveAsync(_session, cancellationToken);
+                await ClosePositionAsync("open-unmanaged-position", cancellationToken);
             }
 
+            await ReconcileExecutionsAsync(null, cancellationToken);
             return;
         }
 
         if (position is null)
         {
+            await ReconcileExecutionsAsync(_session.Trade, cancellationToken);
             await journal.WriteAsync($"position-closed:entry={_session.Trade.EntryPrice}; peak-profit={_session.Trade.PeakProfit}", cancellationToken);
             _session.Trade = null;
             await sessionStore.SaveAsync(_session, cancellationToken);
+            return;
         }
+
+        if (!MatchesTradePosition(position, _session.Trade))
+        {
+            await ClosePositionAsync("saved-state-position-mismatch", cancellationToken);
+            return;
+        }
+
+        if (marketData.LastQuote is not { LastPrice: > 0 } quote ||
+            !await ConfirmExistingStopAsync(_session.Trade, cancellationToken) ||
+            !strategy.IsValidProtectiveStop(_session.Trade, _session.Trade.ConfirmedStop!.Value, quote.LastPrice))
+        {
+            await ClosePositionAsync("unprotected-recovered-position", cancellationToken);
+            return;
+        }
+
+        await ReconcileExecutionsAsync(_session.Trade, cancellationToken);
     }
 
     private async Task SubmitEntryAsync(
@@ -406,9 +445,32 @@ public sealed class Worker(
             return false;
         }
 
+        var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+            .SingleOrDefault(item => item.ContractId == _contract.Id);
+        if (position is null || !MatchesTradePosition(position, trade))
+        {
+            await ClosePositionAsync($"position-mismatch-before-{reason}", cancellationToken);
+            return false;
+        }
+
         requestedStop = trade.Direction == TradeDirection.Long
             ? Math.Floor(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize
             : Math.Ceiling(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize;
+
+        var existingStops = await GetContractStopOrdersAsync(cancellationToken);
+        if (existingStops.Length > 1 ||
+            existingStops.Length == 1 &&
+            (!MatchesProtectiveStop(existingStops[0], trade) ||
+             trade.StopOrderId is long savedOrderId && savedOrderId != existingStops[0].Id))
+        {
+            await ClosePositionAsync($"invalid-or-duplicate-stop-before-{reason}", cancellationToken);
+            return false;
+        }
+
+        if (existingStops.Length == 1 && trade.StopOrderId is null)
+        {
+            trade.StopOrderId = existingStops[0].Id;
+        }
 
         if (trade.ConfirmedStop is decimal currentStop &&
             !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
@@ -465,18 +527,20 @@ public sealed class Worker(
 
     private async Task<bool> ConfirmStopAsync(TradeState trade, decimal expectedStop, CancellationToken cancellationToken)
     {
-        if (_account is null)
+        if (_account is null || _contract is null || trade.StopOrderId is null)
         {
             return false;
         }
 
         for (var attempt = 0; attempt < 3; attempt++)
         {
-            var order = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
-                .SingleOrDefault(item => item.Id == trade.StopOrderId &&
-                                         item.Type == 4 &&
-                                         item.StopPrice == expectedStop);
-            if (order is not null)
+            var stops = await GetContractStopOrdersAsync(cancellationToken);
+            var order = stops.SingleOrDefault();
+            if (stops.Length == 1 &&
+                order is not null &&
+                order.Id == trade.StopOrderId &&
+                MatchesProtectiveStop(order, trade) &&
+                order.StopPrice == expectedStop)
             {
                 trade.ConfirmedStop = order.StopPrice;
                 return true;
@@ -490,14 +554,26 @@ public sealed class Worker(
 
     private async Task<bool> ConfirmExistingStopAsync(TradeState trade, CancellationToken cancellationToken)
     {
-        if (_account is null || trade.StopOrderId is null)
+        if (_account is null || _contract is null)
         {
             return false;
         }
 
-        var order = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
-            .SingleOrDefault(item => item.Id == trade.StopOrderId && item.Type == 4 && item.StopPrice is not null);
-        if (order?.StopPrice is not decimal stop)
+        var stops = await GetContractStopOrdersAsync(cancellationToken);
+        var order = stops.SingleOrDefault();
+        if (stops.Length != 1 ||
+            order is null ||
+            !MatchesProtectiveStop(order, trade) ||
+            order.StopPrice is not decimal stop)
+        {
+            return false;
+        }
+
+        if (trade.StopOrderId is null)
+        {
+            trade.StopOrderId = order.Id;
+        }
+        else if (order.Id != trade.StopOrderId)
         {
             return false;
         }
@@ -508,10 +584,23 @@ public sealed class Worker(
 
     private async Task CloseForSessionEndAsync(CancellationToken cancellationToken)
     {
-        if (_session?.Trade is not null)
+        await CloseOpenContractPositionAsync("4pm-et-session-close", cancellationToken);
+    }
+
+    private async Task CloseOpenContractPositionAsync(string reason, CancellationToken cancellationToken)
+    {
+        if (_account is null || _contract is null)
         {
-            await ClosePositionAsync("4pm-et-session-close", cancellationToken);
+            return;
         }
+
+        if (!(await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+            .Any(position => position.ContractId == _contract.Id))
+        {
+            return;
+        }
+
+        await ClosePositionAsync(reason, cancellationToken);
     }
 
     private async Task ClosePositionAsync(string reason, CancellationToken cancellationToken)
@@ -521,31 +610,89 @@ public sealed class Worker(
             return;
         }
 
+        var trade = _session?.Trade;
         try
         {
             await topstep.ClosePositionAsync(_account.Id, _contract.Id, cancellationToken);
             await journal.WriteAsync($"position-close-submitted:{reason}", cancellationToken);
-            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
-            var start = MarketTime.ToUtc(_session?.TradingDate ?? DateOnly.FromDateTime(MarketTime.ToEastern(DateTimeOffset.UtcNow).Date), new TimeOnly(9, 30));
-            var executions = (await topstep.GetTradesAsync(_account.Id, start, DateTimeOffset.UtcNow, cancellationToken))
-                .Where(trade => trade.ContractId == _contract.Id)
-                .OrderBy(trade => trade.CreationTimestamp);
-            foreach (var execution in executions)
+            for (var attempt = 0; attempt < 3; attempt++)
             {
-                var expectedStop = _session?.Trade?.ConfirmedStop;
-                var stopSlippage = expectedStop is null || execution.Side == (_session?.Trade?.Direction == TradeDirection.Long ? 0 : 1)
-                    ? (decimal?)null
-                    : _session!.Trade!.Direction == TradeDirection.Long
-                        ? expectedStop.Value - execution.Price
-                        : execution.Price - expectedStop.Value;
-                await journal.WriteAsync(
-                    $"actual-execution:order={execution.OrderId}; side={execution.Side}; size={execution.Size}; price={execution.Price}; fees={execution.Fees}; pnl={execution.ProfitAndLoss}; theoretical-stop={expectedStop}; stop-slippage={stopSlippage}",
-                    cancellationToken);
+                await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+                if (!(await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+                    .Any(position => position.ContractId == _contract.Id))
+                {
+                    await ReconcileExecutionsAsync(trade, cancellationToken);
+                    if (_session is not null)
+                    {
+                        _session.Trade = null;
+                        _session.PendingEntryDirection = null;
+                        await sessionStore.SaveAsync(_session, cancellationToken);
+                    }
+
+                    await journal.WriteAsync($"position-close-confirmed:{reason}", cancellationToken);
+                    return;
+                }
             }
+
+            await journal.WriteAsync($"position-close-unconfirmed:{reason}", cancellationToken);
         }
         catch (Exception exception)
         {
             await journal.WriteAsync($"position-close-failed:{reason}; {exception.GetType().Name}:{exception.Message}", cancellationToken);
         }
+    }
+
+    private async Task<TopstepOrder[]> GetContractStopOrdersAsync(CancellationToken cancellationToken)
+    {
+        if (_account is null || _contract is null)
+        {
+            return [];
+        }
+
+        return (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
+            .Where(order => order.ContractId == _contract.Id && order.Type == 4)
+            .ToArray();
+    }
+
+    private static bool MatchesTradePosition(TopstepPosition position, TradeState trade) =>
+        position.ContractId == trade.ContractId &&
+        position.Size == trade.Quantity &&
+        position.Type == (trade.Direction == TradeDirection.Long ? 1 : 2);
+
+    private static bool MatchesProtectiveStop(TopstepOrder order, TradeState trade) =>
+        order.ContractId == trade.ContractId &&
+        order.Status == 1 &&
+        order.Type == 4 &&
+        order.Side == (trade.Direction == TradeDirection.Long ? 1 : 0) &&
+        order.Size == trade.Quantity;
+
+    private async Task ReconcileExecutionsAsync(TradeState? expectedTrade, CancellationToken cancellationToken)
+    {
+        if (_session is null || _account is null || _contract is null)
+        {
+            return;
+        }
+
+        var start = MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue);
+        var executions = (await topstep.GetTradesAsync(_account.Id, start, DateTimeOffset.UtcNow, cancellationToken))
+            .Where(execution => execution.ContractId == _contract.Id)
+            .OrderBy(execution => execution.CreationTimestamp)
+            .ToArray();
+        foreach (var execution in executions.Where(execution => !_session.LoggedTradeIds.Contains(execution.Id)))
+        {
+            var isProtectiveStop = expectedTrade?.StopOrderId == execution.OrderId &&
+                                   execution.Side == (expectedTrade.Direction == TradeDirection.Long ? 1 : 0);
+            var stopSlippage = !isProtectiveStop || expectedTrade?.ConfirmedStop is not decimal expectedStop
+                ? (decimal?)null
+                : expectedTrade.Direction == TradeDirection.Long
+                    ? expectedStop - execution.Price
+                    : execution.Price - expectedStop;
+            await journal.WriteAsync(
+                $"actual-execution:id={execution.Id}; order={execution.OrderId}; side={execution.Side}; size={execution.Size}; price={execution.Price}; commissions={execution.Fees}; realized-pnl={execution.ProfitAndLoss}; theoretical-stop={expectedTrade?.ConfirmedStop}; stop-slippage={stopSlippage}",
+                cancellationToken);
+            _session.LoggedTradeIds.Add(execution.Id);
+        }
+
+        await sessionStore.SaveAsync(_session, cancellationToken);
     }
 }
