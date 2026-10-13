@@ -48,11 +48,6 @@ public sealed class Worker(
     {
         var easternNow = MarketTime.ToEastern(DateTimeOffset.UtcNow);
         var tradingDate = DateOnly.FromDateTime(easternNow.Date);
-        if (easternNow.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
-        {
-            return;
-        }
-
         await _stateLock.WaitAsync(cancellationToken);
         try
         {
@@ -68,6 +63,11 @@ public sealed class Worker(
             _account ??= await topstep.GetTradingAccountAsync(cancellationToken);
             _contract ??= await topstep.GetActiveEsContractAsync(cancellationToken);
             await marketData.EnsureStartedAsync(_contract.Id, cancellationToken);
+
+            if (easternNow.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+            {
+                return;
+            }
 
             if (easternNow.TimeOfDay >= new TimeSpan(16, 0, 0))
             {
@@ -128,13 +128,12 @@ public sealed class Worker(
             0,
             easternNow.Offset);
         _openingRange ??= strategy.GetOpeningRange(_candles, tradingDate);
+        await ResolvePositionStateAsync(cancellationToken);
         if (_openingRange is null)
         {
             await journal.WriteAsync("opening-range-incomplete", cancellationToken);
             return;
         }
-
-        await ResolvePositionStateAsync(cancellationToken);
         if (_session.Trade is not null)
         {
             if (marketData.LastQuote is { LastPrice: > 0 } quote)
@@ -192,6 +191,9 @@ public sealed class Worker(
         var positions = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
             .Where(item => item.ContractId == _contract.Id)
             .ToArray();
+        var openOrders = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
+            .Where(order => order.ContractId == _contract.Id)
+            .ToArray();
         if (positions.Length > 1)
         {
             await ClosePositionAsync("multiple-open-contract-positions", cancellationToken);
@@ -213,6 +215,7 @@ public sealed class Worker(
                 await ClosePositionAsync("open-unmanaged-position", cancellationToken);
             }
 
+            await ReconcilePendingEntryAsync(openOrders, cancellationToken);
             await ReconcileExecutionsAsync(null, cancellationToken);
             return;
         }
@@ -234,7 +237,16 @@ public sealed class Worker(
 
         if (!await ConfirmExistingStopAsync(_session.Trade, cancellationToken))
         {
-            await ClosePositionAsync("unprotected-recovered-position", cancellationToken);
+            if (marketData.LastQuote is not { LastPrice: > 0 } recoveryQuote ||
+                !await EnsureProtectiveStopAsync(
+                    _session.Trade.InitialStop,
+                    "recovery-initial-stop",
+                    recoveryQuote.LastPrice,
+                    cancellationToken))
+            {
+                await ClosePositionAsync("unprotected-recovered-position", cancellationToken);
+            }
+
             return;
         }
 
@@ -252,6 +264,7 @@ public sealed class Worker(
         }
 
         await ReconcileExecutionsAsync(_session.Trade, cancellationToken);
+        await sessionStore.SaveAsync(_session, cancellationToken);
     }
 
     private async Task SubmitEntryAsync(
@@ -290,6 +303,8 @@ public sealed class Worker(
                 stopPrice: null,
                 customTag: tag,
                 cancellationToken);
+            _session.PendingEntryOrderId = order.OrderId;
+            await sessionStore.SaveAsync(_session, cancellationToken);
             await journal.WriteAsync($"entry-submitted:order={order.OrderId}; direction={direction}; size={quantity}; signal-close={breakoutCandle.C}", cancellationToken);
 
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
@@ -303,7 +318,7 @@ public sealed class Worker(
 
     private async Task ActivateFilledEntryAsync(TradeDirection direction, CancellationToken cancellationToken)
     {
-        if (_session is null || _contract is null || _account is null || _openingRange is null)
+        if (_session is null || _contract is null || _account is null)
         {
             return;
         }
@@ -313,6 +328,12 @@ public sealed class Worker(
         if (position is null)
         {
             await journal.WriteAsync("entry-pending:no-position-confirmation", cancellationToken);
+            return;
+        }
+
+        if (_openingRange is null)
+        {
+            await ClosePositionAsync("entry-filled-without-opening-range", cancellationToken);
             return;
         }
 
@@ -329,8 +350,9 @@ public sealed class Worker(
             return;
         }
 
-        var initialStop = strategy.CalculateInitialStop(direction, position.AveragePrice, _openingRange, _candles);
-        if (strategy.GetQuantity(position.AveragePrice, initialStop, options.Value.CommissionAndSlippagePerContract) < position.Size)
+        var entryPrice = await GetActualEntryPriceAsync(direction, position, cancellationToken);
+        var initialStop = strategy.CalculateInitialStop(direction, entryPrice, _openingRange, _candles);
+        if (strategy.GetQuantity(entryPrice, initialStop, options.Value.CommissionAndSlippagePerContract) < position.Size)
         {
             await ClosePositionAsync("filled-risk-exceeds-600", cancellationToken);
             return;
@@ -344,11 +366,12 @@ public sealed class Worker(
             direction,
             _contract.Id,
             position.Size,
-            position.AveragePrice,
+            entryPrice,
             initialStop,
             references.Intraday,
             references.PreviousDay);
         _session.PendingEntryDirection = null;
+        _session.PendingEntryOrderId = null;
 
         if (!await EnsureProtectiveStopAsync(initialStop, "initial-stop", quote.LastPrice, cancellationToken))
         {
@@ -359,6 +382,110 @@ public sealed class Worker(
         await journal.WriteAsync(
             $"entry-filled:direction={direction}; size={position.Size}; actual-entry={position.AveragePrice}; initial-stop={_session.Trade.ConfirmedStop}",
             cancellationToken);
+    }
+
+    private async Task ReconcilePendingEntryAsync(
+        IReadOnlyList<TopstepOrder> openOrders,
+        CancellationToken cancellationToken)
+    {
+        if (_session is null || _account is null || _contract is null ||
+            _session.PendingEntryDirection is not TradeDirection direction)
+        {
+            return;
+        }
+
+        var tag = $"orb-{_session.TradingDate:yyyyMMdd}-entry";
+        var pendingOrders = openOrders
+            .Where(order => order.Type == 2 &&
+                            (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
+            .ToArray();
+        foreach (var order in pendingOrders)
+        {
+            await topstep.CancelOrderAsync(_account.Id, order.Id, cancellationToken);
+            await journal.WriteAsync($"recovery-entry-cancel-submitted:order={order.Id}", cancellationToken);
+        }
+
+        if (pendingOrders.Length > 0)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+            var remainingPendingOrders = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
+                .Where(order => order.ContractId == _contract.Id &&
+                                order.Type == 2 &&
+                                (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
+                .ToArray();
+            if (remainingPendingOrders.Length > 0)
+            {
+                await journal.WriteAsync(
+                    $"recovery-entry-cancel-pending:order={remainingPendingOrders[0].Id}",
+                    cancellationToken);
+                return;
+            }
+
+            var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+                .SingleOrDefault(item => item.ContractId == _contract.Id);
+            if (position is not null)
+            {
+                await ActivateFilledEntryAsync(direction, cancellationToken);
+                return;
+            }
+        }
+
+        var orders = (await topstep.GetOrdersAsync(
+                _account.Id,
+                MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue),
+                DateTimeOffset.UtcNow,
+                cancellationToken))
+            .Where(order => order.ContractId == _contract.Id &&
+                            (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
+            .OrderByDescending(order => order.CreationTimestamp)
+            .ToArray();
+        var latest = orders.FirstOrDefault();
+        var status = latest?.Status switch
+        {
+            2 => "filled",
+            3 => "cancelled",
+            5 => "rejected",
+            4 => "expired",
+            _ => "unavailable"
+        };
+        await journal.WriteAsync(
+            $"recovery-entry-resolved:order={latest?.Id}; status={status}",
+            cancellationToken);
+        _session.PendingEntryDirection = null;
+        _session.PendingEntryOrderId = null;
+        await sessionStore.SaveAsync(_session, cancellationToken);
+    }
+
+    private async Task<decimal> GetActualEntryPriceAsync(
+        TradeDirection direction,
+        TopstepPosition position,
+        CancellationToken cancellationToken)
+    {
+        if (_session is null || _account is null || _contract is null)
+        {
+            return position.AveragePrice;
+        }
+
+        var executions = (await topstep.GetTradesAsync(
+                _account.Id,
+                MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue),
+                DateTimeOffset.UtcNow,
+                cancellationToken))
+            .Where(execution => execution.ContractId == _contract.Id &&
+                                execution.Side == (direction == TradeDirection.Long ? 0 : 1) &&
+                                (_session.PendingEntryOrderId is null ||
+                                 execution.OrderId == _session.PendingEntryOrderId))
+            .ToArray();
+        var filledQuantity = executions.Sum(execution => execution.Size);
+        if (filledQuantity == position.Size)
+        {
+            return executions.Sum(execution => execution.Price * execution.Size) / filledQuantity;
+        }
+
+        await journal.WriteAsync(
+            $"recovery-entry-executions-incomplete:expected-size={position.Size}; execution-size={filledQuantity}; using-position-average={position.AveragePrice}",
+            cancellationToken);
+        return position.AveragePrice;
     }
 
     private async Task ProcessQuoteAsync(Quote quote)

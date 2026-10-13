@@ -32,24 +32,24 @@ public sealed class OrbStrategy
             return time >= premarketStart && time < marketOpen;
         }).ToArray();
 
+        var previousTradingDay = GetPreviousTradingDay(tradingDate);
         var previousRth = allBars
             .Select(candle => (Candle: candle, Time: MarketTime.ToEastern(candle.T)))
-            .Where(item => DateOnly.FromDateTime(item.Time.Date) < tradingDate &&
+            .Where(item => DateOnly.FromDateTime(item.Time.Date) == previousTradingDay &&
                            item.Time.TimeOfDay >= new TimeSpan(9, 30, 0) &&
-                           item.Time.TimeOfDay < new TimeSpan(16, 0, 0))
-            .GroupBy(item => DateOnly.FromDateTime(item.Time.Date))
-            .OrderByDescending(group => group.Key)
-            .FirstOrDefault();
+                           item.Time.TimeOfDay < GetRegularTradingEnd(previousTradingDay))
+            .Select(item => item.Candle)
+            .ToArray();
 
         return (
             HasCompleteMinuteCoverage(intradayBars, premarketStart, marketOpen)
                 ? intradayBars.Max(candle => candle.H)
                 : null,
-            previousRth is not null && HasCompleteMinuteCoverage(
-                previousRth.Select(item => item.Candle),
-                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(9, 30))),
-                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(16, 0))))
-                ? previousRth.Max(item => item.Candle.H)
+            HasCompleteMinuteCoverage(
+                previousRth,
+                MarketTime.ToEastern(MarketTime.ToUtc(previousTradingDay, new TimeOnly(9, 30))),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousTradingDay, TimeOnly.FromTimeSpan(GetRegularTradingEnd(previousTradingDay)))))
+                ? previousRth.Max(candle => candle.H)
                 : null);
     }
 
@@ -64,24 +64,24 @@ public sealed class OrbStrategy
             return time >= premarketStart && time < marketOpen;
         }).ToArray();
 
+        var previousTradingDay = GetPreviousTradingDay(tradingDate);
         var previousRth = allBars
             .Select(candle => (Candle: candle, Time: MarketTime.ToEastern(candle.T)))
-            .Where(item => DateOnly.FromDateTime(item.Time.Date) < tradingDate &&
+            .Where(item => DateOnly.FromDateTime(item.Time.Date) == previousTradingDay &&
                            item.Time.TimeOfDay >= new TimeSpan(9, 30, 0) &&
-                           item.Time.TimeOfDay < new TimeSpan(16, 0, 0))
-            .GroupBy(item => DateOnly.FromDateTime(item.Time.Date))
-            .OrderByDescending(group => group.Key)
-            .FirstOrDefault();
+                           item.Time.TimeOfDay < GetRegularTradingEnd(previousTradingDay))
+            .Select(item => item.Candle)
+            .ToArray();
 
         return (
             HasCompleteMinuteCoverage(intradayBars, premarketStart, marketOpen)
                 ? intradayBars.Min(candle => candle.L)
                 : null,
-            previousRth is not null && HasCompleteMinuteCoverage(
-                previousRth.Select(item => item.Candle),
-                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(9, 30))),
-                MarketTime.ToEastern(MarketTime.ToUtc(previousRth.Key, new TimeOnly(16, 0))))
-                ? previousRth.Min(item => item.Candle.L)
+            HasCompleteMinuteCoverage(
+                previousRth,
+                MarketTime.ToEastern(MarketTime.ToUtc(previousTradingDay, new TimeOnly(9, 30))),
+                MarketTime.ToEastern(MarketTime.ToUtc(previousTradingDay, TimeOnly.FromTimeSpan(GetRegularTradingEnd(previousTradingDay)))))
+                ? previousRth.Min(candle => candle.L)
                 : null);
     }
 
@@ -366,17 +366,135 @@ public sealed class OrbStrategy
     {
         var minutes = candles
             .Select(candle => MarketTime.ToEastern(candle.T))
+            .Where(IsEsMarketOpen)
             .Select(time => new DateTimeOffset(time.Year, time.Month, time.Day, time.Hour, time.Minute, 0, time.Offset))
             .Distinct()
             .OrderBy(time => time)
             .ToArray();
 
-        var expectedMinutes = (int)(end - start).TotalMinutes;
-        return minutes.Length == expectedMinutes &&
-               minutes.Length > 0 &&
-               minutes[0] == start &&
-               minutes[^1] == end.AddMinutes(-1) &&
-               minutes.Zip(minutes.Skip(1), (first, second) => second - first).All(span => span == TimeSpan.FromMinutes(1));
+        var expectedMinutes = EnumerateOpenMinutes(start, end).ToArray();
+        return minutes.SequenceEqual(expectedMinutes);
+    }
+
+    private static DateOnly GetPreviousTradingDay(DateOnly tradingDate)
+    {
+        var previous = tradingDate.AddDays(-1);
+        while (!HasRegularTradingSession(previous))
+        {
+            previous = previous.AddDays(-1);
+        }
+
+        return previous;
+    }
+
+    private static IEnumerable<DateTimeOffset> EnumerateOpenMinutes(DateTimeOffset start, DateTimeOffset end)
+    {
+        for (var time = start; time < end; time = time.AddMinutes(1))
+        {
+            if (IsEsMarketOpen(time))
+            {
+                yield return time;
+            }
+        }
+    }
+
+    private static bool IsEsMarketOpen(DateTimeOffset easternTime)
+    {
+        var date = DateOnly.FromDateTime(easternTime.Date);
+        var time = easternTime.TimeOfDay;
+        if (easternTime.DayOfWeek == DayOfWeek.Saturday ||
+            easternTime.DayOfWeek == DayOfWeek.Sunday && time < new TimeSpan(18, 0, 0) ||
+            easternTime.DayOfWeek == DayOfWeek.Friday && time >= new TimeSpan(17, 0, 0) ||
+            time >= new TimeSpan(17, 0, 0) && time < new TimeSpan(18, 0, 0) ||
+            IsFullMarketHoliday(date) && time < new TimeSpan(18, 0, 0) ||
+            IsEarlyCloseHoliday(date) &&
+            time >= GetRegularTradingEnd(date) &&
+            time < new TimeSpan(18, 0, 0))
+        {
+            return false;
+        }
+
+        if (time >= new TimeSpan(9, 30, 0) && time < GetRegularTradingEnd(date))
+        {
+            return HasRegularTradingSession(date);
+        }
+
+        return true;
+    }
+
+    private static bool HasRegularTradingSession(DateOnly date) =>
+        date.DayOfWeek is not DayOfWeek.Saturday and not DayOfWeek.Sunday &&
+        !IsFullMarketHoliday(date);
+
+    private static TimeSpan GetRegularTradingEnd(DateOnly date) =>
+        IsEarlyCloseHoliday(date) ? new TimeSpan(13, 0, 0) : new TimeSpan(16, 0, 0);
+
+    private static bool IsFullMarketHoliday(DateOnly date)
+    {
+        var year = date.Year;
+        return date == ObserveFixedHoliday(year, 1, 1) ||
+               date == GetGoodFriday(year) ||
+               date == ObserveFixedHoliday(year, 12, 25) ||
+               date == GetThanksgiving(year);
+    }
+
+    private static bool IsEarlyCloseHoliday(DateOnly date)
+    {
+        var year = date.Year;
+        var independenceDay = ObserveFixedHoliday(year, 7, 4);
+        var dayAfterThanksgiving = GetThanksgiving(year).AddDays(1);
+        return date == GetNthWeekday(year, 1, DayOfWeek.Monday, 3) ||
+               date == GetNthWeekday(year, 2, DayOfWeek.Monday, 3) ||
+               date == GetLastWeekday(year, 5, DayOfWeek.Monday) ||
+               date == ObserveFixedHoliday(year, 6, 19) ||
+               date == independenceDay ||
+               date == GetNthWeekday(year, 9, DayOfWeek.Monday, 1) ||
+               date == dayAfterThanksgiving ||
+               date == ObserveFixedHoliday(year, 12, 24);
+    }
+
+    private static DateOnly ObserveFixedHoliday(int year, int month, int day)
+    {
+        var date = new DateOnly(year, month, day);
+        return date.DayOfWeek switch
+        {
+            DayOfWeek.Saturday => date.AddDays(-1),
+            DayOfWeek.Sunday => date.AddDays(1),
+            _ => date
+        };
+    }
+
+    private static DateOnly GetNthWeekday(int year, int month, DayOfWeek dayOfWeek, int occurrence)
+    {
+        var date = new DateOnly(year, month, 1);
+        return date.AddDays(((int)dayOfWeek - (int)date.DayOfWeek + 7) % 7 + ((occurrence - 1) * 7));
+    }
+
+    private static DateOnly GetLastWeekday(int year, int month, DayOfWeek dayOfWeek)
+    {
+        var date = new DateOnly(year, month, DateTime.DaysInMonth(year, month));
+        return date.AddDays(-((int)date.DayOfWeek - (int)dayOfWeek + 7) % 7);
+    }
+
+    private static DateOnly GetThanksgiving(int year) => GetNthWeekday(year, 11, DayOfWeek.Thursday, 4);
+
+    private static DateOnly GetGoodFriday(int year)
+    {
+        var a = year % 19;
+        var b = year / 100;
+        var c = year % 100;
+        var d = b / 4;
+        var e = b % 4;
+        var f = (b + 8) / 25;
+        var g = (b - f + 1) / 3;
+        var h = ((19 * a) + b - d - g + 15) % 30;
+        var i = c / 4;
+        var k = c % 4;
+        var l = (32 + (2 * e) + (2 * i) - h - k) % 7;
+        var m = (a + (11 * h) + (22 * l)) / 451;
+        var month = (h + l - (7 * m) + 114) / 31;
+        var day = ((h + l - (7 * m) + 114) % 31) - 1;
+        return new DateOnly(year, month, day);
     }
 
     private static bool IsUnfilled(FairValueGap gap, IReadOnlyList<Candle> candles) =>
