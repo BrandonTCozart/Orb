@@ -7,8 +7,8 @@ public sealed class TopstepOptions
     public string ApiBaseUrl { get; init; } = "https://api.topstepx.com";
     public string MarketHubUrl { get; init; } = "https://rtc.topstepx.com/hubs/market";
     public string AccountName { get; init; } = "50KTC-SKU-V2-DLL-384690-81916582";
-    public string? UserName { get; init; }
-    public string? ApiKey { get; init; }
+    public string? UserName { get; init; } = "brandon.cozart2000@gmail.com";
+    public string? ApiKey { get; init; } = "DjuaY+KGjwOEBDiUnltkJ0CdQJEQ/0vsOY70rZwEJ3c=";
     public bool Live { get; init; }
     public string DataDirectory { get; init; } = "data";
     public decimal CommissionAndSlippagePerContract { get; init; } = 10m;
