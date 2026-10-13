@@ -171,7 +171,7 @@ public sealed class OrbStrategy
             decimal? profitTarget = profit >= 500m ? ProfitToPrice(trade, 250m) : null;
             var referenceTarget = reference is null
                 ? null
-                : GetReferenceFvgStop(trade, openingRange, reference.Price, candles);
+                : GetReferenceFvgStop(trade, marketPrice, openingRange, reference.Price, candles);
 
             return new StageAction
             {
@@ -267,6 +267,7 @@ public sealed class OrbStrategy
 
     private decimal? GetReferenceFvgStop(
         TradeState trade,
+        decimal marketPrice,
         OpeningRange openingRange,
         decimal reference,
         IReadOnlyList<Candle> candles)
@@ -274,6 +275,7 @@ public sealed class OrbStrategy
         var boundary = trade.Direction == TradeDirection.Long ? openingRange.High : openingRange.Low;
         var candidates = GetFairValueGaps(candles)
             .Where(gap => gap.Bullish == (trade.Direction == TradeDirection.Long))
+            .Where(gap => IsUnfilled(gap, candles))
             .Where(gap => trade.Direction == TradeDirection.Long
                 ? gap.Lower >= boundary && gap.Upper <= reference
                 : gap.Upper <= boundary && gap.Lower >= reference)
@@ -283,6 +285,7 @@ public sealed class OrbStrategy
                 Stop = RoundStop(trade.Direction, trade.Direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize)
             })
             .Where(candidate => GetProfit(trade, candidate.Stop) > 0 &&
+                                IsValidProtectiveStop(trade, candidate.Stop, marketPrice) &&
                                 IsMoreProtective(
                                     trade.Direction,
                                     candidate.Stop,
@@ -349,30 +352,31 @@ public sealed class OrbStrategy
                 yield return new FairValueGap { Bullish = true, Lower = first.H, Upper = third.L, CreatedAt = third.T };
             }
 
-            private static bool HasCompleteMinuteCoverage(
-                IEnumerable<Candle> candles,
-                DateTimeOffset start,
-                DateTimeOffset end)
-            {
-                var minutes = candles
-                    .Select(candle => MarketTime.ToEastern(candle.T))
-                    .Select(time => new DateTimeOffset(time.Year, time.Month, time.Day, time.Hour, time.Minute, 0, time.Offset))
-                    .Distinct()
-                    .OrderBy(time => time)
-                    .ToArray();
-
-                var expectedMinutes = (int)(end - start).TotalMinutes;
-                return minutes.Length == expectedMinutes &&
-                       minutes.Length > 0 &&
-                       minutes[0] == start &&
-                       minutes[^1] == end.AddMinutes(-1) &&
-                       minutes.Zip(minutes.Skip(1), (first, second) => second - first).All(span => span == TimeSpan.FromMinutes(1));
-            }
             else if (third.H < first.L)
             {
                 yield return new FairValueGap { Bullish = false, Lower = third.H, Upper = first.L, CreatedAt = third.T };
             }
         }
+    }
+
+    private static bool HasCompleteMinuteCoverage(
+        IEnumerable<Candle> candles,
+        DateTimeOffset start,
+        DateTimeOffset end)
+    {
+        var minutes = candles
+            .Select(candle => MarketTime.ToEastern(candle.T))
+            .Select(time => new DateTimeOffset(time.Year, time.Month, time.Day, time.Hour, time.Minute, 0, time.Offset))
+            .Distinct()
+            .OrderBy(time => time)
+            .ToArray();
+
+        var expectedMinutes = (int)(end - start).TotalMinutes;
+        return minutes.Length == expectedMinutes &&
+               minutes.Length > 0 &&
+               minutes[0] == start &&
+               minutes[^1] == end.AddMinutes(-1) &&
+               minutes.Zip(minutes.Skip(1), (first, second) => second - first).All(span => span == TimeSpan.FromMinutes(1));
     }
 
     private static bool IsUnfilled(FairValueGap gap, IReadOnlyList<Candle> candles) =>

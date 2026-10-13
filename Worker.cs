@@ -584,7 +584,26 @@ public sealed class Worker(
 
     private async Task CloseForSessionEndAsync(CancellationToken cancellationToken)
     {
-        await CloseOpenContractPositionAsync("4pm-et-session-close", cancellationToken);
+        if (_account is null || _contract is null)
+        {
+            return;
+        }
+
+        var contractIds = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+            .Select(position => position.ContractId)
+            .Distinct()
+            .ToArray();
+        foreach (var contractId in contractIds)
+        {
+            if (contractId == _contract.Id)
+            {
+                await ClosePositionAsync("4pm-et-session-close", cancellationToken);
+            }
+            else
+            {
+                await CloseAdditionalContractAsync(contractId, cancellationToken);
+            }
+        }
     }
 
     private async Task CloseOpenContractPositionAsync(string reason, CancellationToken cancellationToken)
@@ -639,6 +658,35 @@ public sealed class Worker(
         catch (Exception exception)
         {
             await journal.WriteAsync($"position-close-failed:{reason}; {exception.GetType().Name}:{exception.Message}", cancellationToken);
+        }
+    }
+
+    private async Task CloseAdditionalContractAsync(string contractId, CancellationToken cancellationToken)
+    {
+        if (_account is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await topstep.ClosePositionAsync(_account.Id, contractId, cancellationToken);
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+                if (!(await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+                    .Any(position => position.ContractId == contractId))
+                {
+                    await journal.WriteAsync($"position-close-confirmed:4pm-et-session-close; contract={contractId}", cancellationToken);
+                    return;
+                }
+            }
+
+            await journal.WriteAsync($"position-close-unconfirmed:4pm-et-session-close; contract={contractId}", cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            await journal.WriteAsync($"position-close-failed:4pm-et-session-close; contract={contractId}; {exception.GetType().Name}:{exception.Message}", cancellationToken);
         }
     }
 
