@@ -278,14 +278,6 @@ public sealed class Worker(
             return;
         }
 
-        var expectedEntry = marketData.LastQuote is { LastPrice: > 0 } quote ? quote.LastPrice : breakoutCandle.C;
-        var initialStop = strategy.CalculateInitialStop(
-            direction,
-            expectedEntry,
-            _openingRange,
-            _candles,
-            options.Value.CommissionAndSlippagePerContract);
-
         _session.TradeSubmitted = true;
         _session.PendingEntryDirection = direction;
         await sessionStore.SaveAsync(_session, cancellationToken);
