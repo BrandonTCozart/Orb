@@ -5,6 +5,8 @@ public sealed class OrbStrategy
     public const decimal EsPointValue = 50m;
     public const decimal TickSize = 0.25m;
     public const decimal MaxInitialRisk = 600m;
+    public const decimal DefaultInitialStopRisk = 500m;
+    public const int EntryQuantity = 1;
 
     public OpeningRange? GetOpeningRange(IEnumerable<Candle> candles, DateOnly tradingDate)
     {
@@ -89,12 +91,6 @@ public sealed class OrbStrategy
         candle.C > openingRange.High ? TradeDirection.Long :
         candle.C < openingRange.Low ? TradeDirection.Short : null;
 
-    public int GetQuantity(decimal entryPrice, decimal stopPrice, decimal allowance)
-    {
-        var riskPerContract = Math.Abs(entryPrice - stopPrice) * EsPointValue + allowance;
-        return riskPerContract <= 0 ? 0 : (int)Math.Floor(MaxInitialRisk / riskPerContract);
-    }
-
     public TradeState CreateTrade(
         TradeDirection direction,
         string contractId,
@@ -123,15 +119,23 @@ public sealed class OrbStrategy
         TradeDirection direction,
         decimal entryPrice,
         OpeningRange openingRange,
-        IReadOnlyList<Candle> candles)
+        IReadOnlyList<Candle> candles,
+        decimal allowance)
     {
         var defaultStop = direction == TradeDirection.Long
             ? openingRange.High - (openingRange.Width * .75m)
             : openingRange.Low + (openingRange.Width * .75m);
         var fvgStop = FindInitialFvgStop(direction, entryPrice, openingRange, candles);
-        return RoundStop(direction, fvgStop is not null && IsMoreProtective(direction, fvgStop.Value, defaultStop)
+        var selectedStop = RoundStop(direction, fvgStop is not null && IsMoreProtective(direction, fvgStop.Value, defaultStop)
             ? fvgStop.Value
             : defaultStop);
+        return GetInitialRisk(entryPrice, selectedStop, allowance) <= MaxInitialRisk
+            ? selectedStop
+            : RoundStop(
+                direction,
+                direction == TradeDirection.Long
+                    ? entryPrice - (DefaultInitialStopRisk / EsPointValue)
+                    : entryPrice + (DefaultInitialStopRisk / EsPointValue));
     }
 
     public StageAction? GetNextStageAction(
@@ -214,6 +218,9 @@ public sealed class OrbStrategy
     public decimal GetProfit(TradeState trade, decimal price) =>
         (trade.Direction == TradeDirection.Long ? price - trade.EntryPrice : trade.EntryPrice - price)
         * EsPointValue * trade.Quantity;
+
+    private static decimal GetInitialRisk(decimal entryPrice, decimal stopPrice, decimal allowance) =>
+        Math.Abs(entryPrice - stopPrice) * EsPointValue + allowance;
 
     public bool IsValidProtectiveStop(TradeState trade, decimal stop, decimal marketPrice) =>
         trade.Direction == TradeDirection.Long ? stop < marketPrice : stop > marketPrice;

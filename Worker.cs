@@ -279,14 +279,12 @@ public sealed class Worker(
         }
 
         var expectedEntry = marketData.LastQuote is { LastPrice: > 0 } quote ? quote.LastPrice : breakoutCandle.C;
-        var initialStop = strategy.CalculateInitialStop(direction, expectedEntry, _openingRange, _candles);
-        var quantity = strategy.GetQuantity(expectedEntry, initialStop, options.Value.CommissionAndSlippagePerContract);
-        if (quantity < 1)
-        {
-            await journal.WriteAsync($"entry-rejected:risk-over-600; direction={direction}; expected-entry={expectedEntry}; stop={initialStop}", cancellationToken);
-            _session.TradeSubmitted = true;
-            return;
-        }
+        var initialStop = strategy.CalculateInitialStop(
+            direction,
+            expectedEntry,
+            _openingRange,
+            _candles,
+            options.Value.CommissionAndSlippagePerContract);
 
         _session.TradeSubmitted = true;
         _session.PendingEntryDirection = direction;
@@ -299,13 +297,13 @@ public sealed class Worker(
                 _contract.Id,
                 type: 2,
                 side: direction == TradeDirection.Long ? 0 : 1,
-                size: quantity,
+                size: OrbStrategy.EntryQuantity,
                 stopPrice: null,
                 customTag: tag,
                 cancellationToken);
             _session.PendingEntryOrderId = order.OrderId;
             await sessionStore.SaveAsync(_session, cancellationToken);
-            await journal.WriteAsync($"entry-submitted:order={order.OrderId}; direction={direction}; size={quantity}; signal-close={breakoutCandle.C}", cancellationToken);
+            await journal.WriteAsync($"entry-submitted:order={order.OrderId}; direction={direction}; size={OrbStrategy.EntryQuantity}; signal-close={breakoutCandle.C}", cancellationToken);
 
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
             await ActivateFilledEntryAsync(direction, cancellationToken);
@@ -350,13 +348,19 @@ public sealed class Worker(
             return;
         }
 
-        var entryPrice = await GetActualEntryPriceAsync(direction, position, cancellationToken);
-        var initialStop = strategy.CalculateInitialStop(direction, entryPrice, _openingRange, _candles);
-        if (strategy.GetQuantity(entryPrice, initialStop, options.Value.CommissionAndSlippagePerContract) < position.Size)
+        if (position.Size != OrbStrategy.EntryQuantity)
         {
-            await ClosePositionAsync("filled-risk-exceeds-600", cancellationToken);
+            await ClosePositionAsync("entry-size-not-one-contract", cancellationToken);
             return;
         }
+
+        var entryPrice = await GetActualEntryPriceAsync(direction, position, cancellationToken);
+        var initialStop = strategy.CalculateInitialStop(
+            direction,
+            entryPrice,
+            _openingRange,
+            _candles,
+            options.Value.CommissionAndSlippagePerContract);
 
         var date = _session.TradingDate;
         var references = direction == TradeDirection.Long
@@ -841,6 +845,7 @@ public sealed class Worker(
 
     private static bool MatchesTradePosition(TopstepPosition position, TradeState trade) =>
         position.ContractId == trade.ContractId &&
+        trade.Quantity == OrbStrategy.EntryQuantity &&
         position.Size == trade.Quantity &&
         position.Type == (trade.Direction == TradeDirection.Long ? 1 : 2);
 
