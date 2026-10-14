@@ -311,6 +311,7 @@ public sealed class OrbStrategy
     {
         var candidates = GetFairValueGaps(candles)
             .Where(gap => gap.Bullish == (direction == TradeDirection.Long))
+            .Where(gap => IsUnfilled(gap, candles))
             .Select(gap => new
             {
                 Stop = RoundStop(direction, direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize),
