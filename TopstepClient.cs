@@ -154,9 +154,25 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
             new { accountId, orderId, size, limitPrice = (decimal?)null, stopPrice, trailPrice = (decimal?)null },
             cancellationToken);
 
+    public Task<ApiResponse> CancelOrderAsync(int accountId, long orderId, CancellationToken cancellationToken) =>
+        PostAsync<ApiResponse>("/api/Order/cancel", new { accountId, orderId }, cancellationToken);
+
     public async Task<IReadOnlyList<TopstepOrder>> GetOpenOrdersAsync(int accountId, CancellationToken cancellationToken)
     {
         var result = await PostAsync<OpenOrdersResponse>("/api/Order/searchOpen", new { accountId }, cancellationToken);
+        return result.Orders;
+    }
+
+    public async Task<IReadOnlyList<TopstepOrder>> GetOrdersAsync(
+        int accountId,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        CancellationToken cancellationToken)
+    {
+        var result = await PostAsync<OrdersResponse>(
+            "/api/Order/search",
+            new { accountId, startTimestamp = start, endTimestamp = end },
+            cancellationToken);
         return result.Orders;
     }
 

@@ -91,16 +91,23 @@ public sealed class OpenOrdersResponse : ApiResponse
     public List<TopstepOrder> Orders { get; init; } = [];
 }
 
+public sealed class OrdersResponse : ApiResponse
+{
+    public List<TopstepOrder> Orders { get; init; } = [];
+}
+
 public sealed class TopstepOrder
 {
     public long Id { get; init; }
     public string ContractId { get; init; } = string.Empty;
+    public DateTimeOffset CreationTimestamp { get; init; }
     public int Status { get; init; }
     public int Type { get; init; }
     public int Side { get; init; }
     public int Size { get; init; }
     public decimal? StopPrice { get; init; }
     public decimal? FilledPrice { get; init; }
+    public int FillVolume { get; init; }
     public string? CustomTag { get; init; }
 }
 
@@ -173,6 +180,7 @@ public sealed class OrbSessionState
     public DateOnly TradingDate { get; init; }
     public bool TradeSubmitted { get; set; }
     public TradeDirection? PendingEntryDirection { get; set; }
+    public long? PendingEntryOrderId { get; set; }
     public DateTimeOffset? LastEntryCandle { get; set; }
     public TradeState? Trade { get; set; }
     public List<long> LoggedTradeIds { get; init; } = [];
