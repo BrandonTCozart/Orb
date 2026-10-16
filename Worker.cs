@@ -18,6 +18,10 @@ public sealed class Worker(
     private OpeningRange? _openingRange;
     private IReadOnlyList<Candle> _candles = [];
     private DateTimeOffset? _lastHistoryMinute;
+    private DateTimeOffset? _lastReconciliationMinute;
+    private Candle? _liveCandle;
+    private (decimal? Intraday, decimal? PreviousDay)? _longReferenceLevels;
+    private (decimal? Intraday, decimal? PreviousDay)? _shortReferenceLevels;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -57,6 +61,10 @@ public sealed class Worker(
                 _openingRange = null;
                 _candles = [];
                 _lastHistoryMinute = null;
+                _lastReconciliationMinute = null;
+                _liveCandle = null;
+                _longReferenceLevels = null;
+                _shortReferenceLevels = null;
                 await journal.WriteAsync($"trading-date:{tradingDate:yyyy-MM-dd}", cancellationToken);
             }
 
@@ -78,15 +86,33 @@ public sealed class Worker(
             if (easternNow.TimeOfDay < new TimeSpan(9, 45, 0))
             {
                 await CloseOpenContractPositionAsync("position-outside-trading-window", cancellationToken);
+                if (IsNewHistoryMinute(easternNow))
+                {
+                    await RefreshHistoricalDataAsync(tradingDate, easternNow, cancellationToken);
+                }
+
                 return;
             }
 
-            if (!IsNewHistoryMinute(easternNow))
+            if (_openingRange is null)
             {
-                return;
+                if (IsNewHistoryMinute(easternNow))
+                {
+                    await RefreshHistoricalDataAsync(tradingDate, easternNow, cancellationToken);
+                }
+
+                if (_openingRange is null)
+                {
+                    await journal.WriteAsync("opening-range-incomplete", cancellationToken);
+                    return;
+                }
             }
 
-            await RefreshBarsAndProcessAsync(tradingDate, easternNow, cancellationToken);
+            await CloseLiveCandleIfDueAsync(easternNow, cancellationToken);
+            if (IsNewReconciliationMinute(easternNow))
+            {
+                await ResolvePositionStateAsync(cancellationToken);
+            }
         }
         finally
         {
@@ -96,18 +122,33 @@ public sealed class Worker(
 
     private bool IsNewHistoryMinute(DateTimeOffset easternNow)
     {
-        var minute = new DateTimeOffset(
-            easternNow.Year,
-            easternNow.Month,
-            easternNow.Day,
-            easternNow.Hour,
-            easternNow.Minute,
-            0,
-            easternNow.Offset);
+        var minute = GetMinute(easternNow);
         return easternNow.Second >= 2 && _lastHistoryMinute != minute;
     }
 
-    private async Task RefreshBarsAndProcessAsync(
+    private bool IsNewReconciliationMinute(DateTimeOffset easternNow)
+    {
+        var minute = GetMinute(easternNow);
+        if (easternNow.Second < 2 || _lastReconciliationMinute == minute)
+        {
+            return false;
+        }
+
+        _lastReconciliationMinute = minute;
+        return true;
+    }
+
+    private static DateTimeOffset GetMinute(DateTimeOffset time) =>
+        new(
+            time.Year,
+            time.Month,
+            time.Day,
+            time.Hour,
+            time.Minute,
+            0,
+            time.Offset);
+
+    private async Task RefreshHistoricalDataAsync(
         DateOnly tradingDate,
         DateTimeOffset easternNow,
         CancellationToken cancellationToken)
@@ -118,67 +159,13 @@ public sealed class Worker(
         }
 
         var start = MarketTime.ToUtc(tradingDate.AddDays(-7), TimeOnly.MinValue);
-        _candles = await topstep.GetMinuteBarsAsync(_contract.Id, start, easternNow.ToUniversalTime(), cancellationToken);
-        _lastHistoryMinute = new DateTimeOffset(
-            easternNow.Year,
-            easternNow.Month,
-            easternNow.Day,
-            easternNow.Hour,
-            easternNow.Minute,
-            0,
-            easternNow.Offset);
-        _openingRange ??= strategy.GetOpeningRange(_candles, tradingDate);
-        await ResolvePositionStateAsync(cancellationToken);
-        if (_openingRange is null)
-        {
-            await journal.WriteAsync("opening-range-incomplete", cancellationToken);
-            return;
-        }
-        if (_session.Trade is not null)
-        {
-            if (marketData.LastQuote is { LastPrice: > 0 } quote)
-            {
-                await ProcessTradeAsync(quote.LastPrice, cancellationToken);
-            }
-
-            return;
-        }
-
-        if (_session.TradeSubmitted)
-        {
-            return;
-        }
-
-        var unseenCompletedCandles = _candles
-            .Where(candle =>
-            {
-                var time = MarketTime.ToEastern(candle.T);
-                return DateOnly.FromDateTime(time.Date) == tradingDate &&
-                       time.TimeOfDay >= new TimeSpan(9, 45, 0) &&
-                       time <= easternNow.AddMinutes(-1);
-            })
-            .Where(candle => _session.LastEntryCandle is null || candle.T > _session.LastEntryCandle)
-            .OrderBy(candle => candle.T)
-            .ToArray();
-
-        foreach (var candle in unseenCompletedCandles)
-        {
-            _session.LastEntryCandle = candle.T;
-            if (easternNow - MarketTime.ToEastern(candle.T) > TimeSpan.FromMinutes(2))
-            {
-                await journal.WriteAsync($"entry-skipped:stale-breakout-candle={candle.T:O}", cancellationToken);
-                continue;
-            }
-
-            var direction = strategy.GetBreakout(candle, _openingRange);
-            if (direction is not null)
-            {
-                await SubmitEntryAsync(direction.Value, candle, tradingDate, cancellationToken);
-                break;
-            }
-        }
-
-        await sessionStore.SaveAsync(_session, cancellationToken);
+        var openingRangeEnd = MarketTime.ToUtc(tradingDate, new TimeOnly(9, 45));
+        var end = easternNow < MarketTime.ToEastern(openingRangeEnd) ? easternNow.ToUniversalTime() : openingRangeEnd;
+        _candles = await topstep.GetMinuteBarsAsync(_contract.Id, start, end, cancellationToken);
+        _lastHistoryMinute = GetMinute(easternNow);
+        _openingRange = strategy.GetOpeningRange(_candles, tradingDate);
+        _longReferenceLevels = strategy.GetReferenceLevels(_candles, tradingDate);
+        _shortReferenceLevels = strategy.GetShortReferenceLevels(_candles, tradingDate);
     }
 
     private async Task ResolvePositionStateAsync(CancellationToken cancellationToken)
@@ -356,8 +343,8 @@ public sealed class Worker(
 
         var date = _session.TradingDate;
         var references = direction == TradeDirection.Long
-            ? strategy.GetReferenceLevels(_candles, date)
-            : strategy.GetShortReferenceLevels(_candles, date);
+            ? _longReferenceLevels ?? strategy.GetReferenceLevels(_candles, date)
+            : _shortReferenceLevels ?? strategy.GetShortReferenceLevels(_candles, date);
         _session.Trade = strategy.CreateTrade(
             direction,
             _contract.Id,
@@ -494,6 +481,7 @@ public sealed class Worker(
         await _stateLock.WaitAsync();
         try
         {
+            await UpdateLiveCandleAsync(quote, CancellationToken.None);
             if (_session?.Trade is not null && _openingRange is not null)
             {
                 await ProcessTradeAsync(quote.LastPrice, CancellationToken.None);
@@ -509,6 +497,127 @@ public sealed class Worker(
             _stateLock.Release();
         }
     }
+
+    private async Task UpdateLiveCandleAsync(Quote quote, CancellationToken cancellationToken)
+    {
+        if (_session is null)
+        {
+            return;
+        }
+
+        var easternTime = MarketTime.ToEastern(quote.Timestamp);
+        var tradingDate = DateOnly.FromDateTime(easternTime.Date);
+        if (tradingDate != _session.TradingDate ||
+            easternTime.TimeOfDay < new TimeSpan(9, 45, 0) ||
+            easternTime.TimeOfDay >= new TimeSpan(16, 0, 0))
+        {
+            return;
+        }
+
+        var candleTime = MarketTime.ToUtc(
+            tradingDate,
+            new TimeOnly(easternTime.Hour, easternTime.Minute));
+        if (_liveCandle is null)
+        {
+            _liveCandle = CreateLiveCandle(candleTime, quote.LastPrice);
+            return;
+        }
+
+        if (candleTime < _liveCandle.T)
+        {
+            return;
+        }
+
+        if (candleTime > _liveCandle.T)
+        {
+            await ProcessClosedCandleAsync(_liveCandle, easternTime, cancellationToken);
+            _liveCandle = CreateLiveCandle(candleTime, quote.LastPrice);
+            return;
+        }
+
+        _liveCandle = new Candle
+        {
+            T = _liveCandle.T,
+            O = _liveCandle.O,
+            H = Math.Max(_liveCandle.H, quote.LastPrice),
+            L = Math.Min(_liveCandle.L, quote.LastPrice),
+            C = quote.LastPrice,
+            V = 0
+        };
+    }
+
+    private async Task CloseLiveCandleIfDueAsync(DateTimeOffset easternNow, CancellationToken cancellationToken)
+    {
+        if (_liveCandle is null ||
+            _session is null ||
+            DateOnly.FromDateTime(easternNow.Date) != _session.TradingDate)
+        {
+            return;
+        }
+
+        var currentMinute = MarketTime.ToUtc(
+            _session.TradingDate,
+            new TimeOnly(easternNow.Hour, easternNow.Minute));
+        if (_liveCandle.T >= currentMinute)
+        {
+            return;
+        }
+
+        var candle = _liveCandle;
+        _liveCandle = null;
+        await ProcessClosedCandleAsync(candle, easternNow, cancellationToken);
+    }
+
+    private async Task ProcessClosedCandleAsync(
+        Candle candle,
+        DateTimeOffset easternNow,
+        CancellationToken cancellationToken)
+    {
+        _candles = _candles
+            .Append(candle)
+            .GroupBy(item => item.T)
+            .Select(group => group.Last())
+            .OrderBy(item => item.T)
+            .ToArray();
+
+        if (_session is null ||
+            _openingRange is null ||
+            _session.Trade is not null ||
+            _session.TradeSubmitted ||
+            (_session.LastEntryCandle is not null && candle.T <= _session.LastEntryCandle))
+        {
+            return;
+        }
+
+        _session.LastEntryCandle = candle.T;
+        if (easternNow - MarketTime.ToEastern(candle.T) > TimeSpan.FromMinutes(2))
+        {
+            await journal.WriteAsync($"entry-skipped:stale-breakout-candle={candle.T:O}", cancellationToken);
+            await sessionStore.SaveAsync(_session, cancellationToken);
+            return;
+        }
+
+        var direction = strategy.GetBreakout(candle, _openingRange);
+        if (direction is not null)
+        {
+            await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, cancellationToken);
+        }
+        else
+        {
+            await sessionStore.SaveAsync(_session, cancellationToken);
+        }
+    }
+
+    private static Candle CreateLiveCandle(DateTimeOffset timestamp, decimal price) =>
+        new()
+        {
+            T = timestamp,
+            O = price,
+            H = price,
+            L = price,
+            C = price,
+            V = 0
+        };
 
     private async Task ProcessTradeAsync(decimal marketPrice, CancellationToken cancellationToken)
     {
