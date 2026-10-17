@@ -119,7 +119,6 @@ public sealed class OrbStrategy
         TradeDirection direction,
         decimal entryPrice,
         OpeningRange openingRange,
-        IReadOnlyList<Candle> candles,
         decimal allowance)
     {
         var orbStop = RoundStop(direction, direction == TradeDirection.Long
@@ -311,27 +310,6 @@ public sealed class OrbStrategy
             .ToArray();
 
         return candidates.FirstOrDefault()?.Stop;
-    }
-
-    private decimal? FindInitialFvgStop(
-        TradeDirection direction,
-        decimal entryPrice,
-        OpeningRange openingRange,
-        IReadOnlyList<Candle> candles)
-    {
-        var candidates = GetFairValueGaps(candles)
-            .Where(gap => gap.Bullish == (direction == TradeDirection.Long))
-            .Where(gap => IsUnfilled(gap, candles))
-            .Select(gap => new
-            {
-                Stop = RoundStop(direction, direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize),
-                Qualifies = direction == TradeDirection.Long ? gap.Lower > openingRange.Midpoint : gap.Upper < openingRange.Midpoint
-            })
-            .Where(item => item.Qualifies && (direction == TradeDirection.Long ? item.Stop < entryPrice : item.Stop > entryPrice))
-            .Select(item => item.Stop);
-
-        var stops = candidates.ToArray();
-        return stops.Length == 0 ? null : direction == TradeDirection.Long ? stops.Max() : stops.Min();
     }
 
     private decimal? FindStage3FvgStop(

@@ -338,7 +338,6 @@ public sealed class Worker(
             direction,
             entryPrice,
             _openingRange,
-            _candles,
             options.Value.CommissionAndSlippagePerContract);
 
         var date = _session.TradingDate;
