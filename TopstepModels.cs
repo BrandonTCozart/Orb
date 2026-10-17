@@ -166,6 +166,13 @@ public sealed class OpeningRange
     public decimal Width => High - Low;
 }
 
+public sealed class InitialStopCalculation
+{
+    public decimal Stop { get; init; }
+    public decimal EstimatedRisk { get; init; }
+    public bool UsedFallback { get; init; }
+}
+
 public sealed class FairValueGap
 {
     public bool Bullish { get; init; }

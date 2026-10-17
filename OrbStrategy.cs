@@ -115,27 +115,36 @@ public sealed class OrbStrategy
         };
     }
 
-    public decimal CalculateInitialStop(
+    public InitialStopCalculation CalculateInitialStop(
         TradeDirection direction,
         decimal entryPrice,
         OpeningRange openingRange,
-        IReadOnlyList<Candle> candles,
         decimal allowance)
     {
-        var defaultStop = direction == TradeDirection.Long
+        var orbStop = RoundStop(direction, direction == TradeDirection.Long
             ? openingRange.High - (openingRange.Width * .75m)
-            : openingRange.Low + (openingRange.Width * .75m);
-        var fvgStop = FindInitialFvgStop(direction, entryPrice, openingRange, candles);
-        var selectedStop = RoundStop(direction, fvgStop is not null && IsMoreProtective(direction, fvgStop.Value, defaultStop)
-            ? fvgStop.Value
-            : defaultStop);
-        return GetInitialRisk(entryPrice, selectedStop, allowance) <= MaxInitialRisk
-            ? selectedStop
-            : RoundStop(
-                direction,
-                direction == TradeDirection.Long
-                    ? entryPrice - (DefaultInitialStopRisk / EsPointValue)
-                    : entryPrice + (DefaultInitialStopRisk / EsPointValue));
+            : openingRange.Low + (openingRange.Width * .75m));
+        var orbRisk = GetInitialRisk(entryPrice, orbStop, allowance);
+        if (orbRisk <= MaxInitialRisk)
+        {
+            return new InitialStopCalculation
+            {
+                Stop = orbStop,
+                EstimatedRisk = orbRisk
+            };
+        }
+
+        var fallbackStop = RoundStop(
+            direction,
+            direction == TradeDirection.Long
+                ? entryPrice - (DefaultInitialStopRisk / EsPointValue)
+                : entryPrice + (DefaultInitialStopRisk / EsPointValue));
+        return new InitialStopCalculation
+        {
+            Stop = fallbackStop,
+            EstimatedRisk = GetInitialRisk(entryPrice, fallbackStop, allowance),
+            UsedFallback = true
+        };
     }
 
     public StageAction? GetNextStageAction(
@@ -266,8 +275,8 @@ public sealed class OrbStrategy
         IReadOnlyList<Candle> candles)
     {
         var defaultStop = trade.Direction == TradeDirection.Long
-            ? openingRange.High - (openingRange.Width * .25m)
-            : openingRange.Low + (openingRange.Width * .25m);
+            ? openingRange.High - (openingRange.Width * .35m)
+            : openingRange.Low + (openingRange.Width * .35m);
         var fvgStop = FindStage3FvgStop(trade.Direction, marketPrice, openingRange, candles);
         return MoreProtective(trade.Direction, RoundStop(trade.Direction, defaultStop), fvgStop);
     }
@@ -303,27 +312,6 @@ public sealed class OrbStrategy
         return candidates.FirstOrDefault()?.Stop;
     }
 
-    private decimal? FindInitialFvgStop(
-        TradeDirection direction,
-        decimal entryPrice,
-        OpeningRange openingRange,
-        IReadOnlyList<Candle> candles)
-    {
-        var candidates = GetFairValueGaps(candles)
-            .Where(gap => gap.Bullish == (direction == TradeDirection.Long))
-            .Where(gap => IsUnfilled(gap, candles))
-            .Select(gap => new
-            {
-                Stop = RoundStop(direction, direction == TradeDirection.Long ? gap.Lower - TickSize : gap.Upper + TickSize),
-                Qualifies = direction == TradeDirection.Long ? gap.Lower > openingRange.Midpoint : gap.Upper < openingRange.Midpoint
-            })
-            .Where(item => item.Qualifies && (direction == TradeDirection.Long ? item.Stop < entryPrice : item.Stop > entryPrice))
-            .Select(item => item.Stop);
-
-        var stops = candidates.ToArray();
-        return stops.Length == 0 ? null : direction == TradeDirection.Long ? stops.Max() : stops.Min();
-    }
-
     private decimal? FindStage3FvgStop(
         TradeDirection direction,
         decimal marketPrice,
@@ -331,8 +319,8 @@ public sealed class OrbStrategy
         IReadOnlyList<Candle> candles)
     {
         var nearBoundary = direction == TradeDirection.Long
-            ? openingRange.High - (openingRange.Width * .25m)
-            : openingRange.Low + (openingRange.Width * .25m);
+            ? openingRange.High - (openingRange.Width * .35m)
+            : openingRange.Low + (openingRange.Width * .35m);
 
         var candidates = GetFairValueGaps(candles)
             .Where(gap => gap.Bullish == (direction == TradeDirection.Long))

@@ -338,7 +338,6 @@ public sealed class Worker(
             direction,
             entryPrice,
             _openingRange,
-            _candles,
             options.Value.CommissionAndSlippagePerContract);
 
         var date = _session.TradingDate;
@@ -350,13 +349,16 @@ public sealed class Worker(
             _contract.Id,
             position.Size,
             entryPrice,
-            initialStop,
+            initialStop.Stop,
             references.Intraday,
             references.PreviousDay);
         _session.PendingEntryDirection = null;
         _session.PendingEntryOrderId = null;
 
-        if (!await EnsureProtectiveStopAsync(initialStop, "initial-stop", quote.LastPrice, cancellationToken))
+        await journal.WriteAsync(
+            $"initial-stop-calculated:orb-high={_openingRange.High}; orb-low={_openingRange.Low}; entry={entryPrice}; calculated-stop={initialStop.Stop}; estimated-risk={initialStop.EstimatedRisk}; fallback-used={initialStop.UsedFallback}",
+            cancellationToken);
+        if (!await EnsureProtectiveStopAsync(initialStop.Stop, "initial-stop", quote.LastPrice, cancellationToken))
         {
             return;
         }
@@ -728,6 +730,9 @@ public sealed class Worker(
 
         try
         {
+            await journal.WriteAsync(
+                $"stop-adjustment-attempted:{reason}; action={(trade.StopOrderId is null ? "place" : "modify")}; order={trade.StopOrderId}; price={requestedStop}",
+                cancellationToken);
             if (trade.StopOrderId is null)
             {
                 var response = await topstep.PlaceOrderAsync(
@@ -748,7 +753,7 @@ public sealed class Worker(
 
             if (await ConfirmStopAsync(trade, requestedStop, cancellationToken))
             {
-                await journal.WriteAsync($"stop-confirmed:{reason}; order={trade.StopOrderId}; price={requestedStop}", cancellationToken);
+                await journal.WriteAsync($"stop-adjustment-confirmed:{reason}; order={trade.StopOrderId}; price={requestedStop}", cancellationToken);
                 return true;
             }
         }
@@ -872,35 +877,52 @@ public sealed class Worker(
         }
 
         var trade = _session?.Trade;
-        try
+        var closeSubmitted = false;
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            await topstep.ClosePositionAsync(_account.Id, _contract.Id, cancellationToken);
-            await journal.WriteAsync($"position-close-submitted:{reason}", cancellationToken);
-            for (var attempt = 0; attempt < 3; attempt++)
+            if (attempt > 0)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
-                if (!(await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-                    .Any(position => position.ContractId == _contract.Id))
-                {
-                    await ReconcileExecutionsAsync(trade, cancellationToken);
-                    if (_session is not null)
-                    {
-                        _session.Trade = null;
-                        _session.PendingEntryDirection = null;
-                        await sessionStore.SaveAsync(_session, cancellationToken);
-                    }
-
-                    await journal.WriteAsync($"position-close-confirmed:{reason}", cancellationToken);
-                    return;
-                }
             }
 
-            await journal.WriteAsync($"position-close-unconfirmed:{reason}", cancellationToken);
+            if (!await IsContractPositionOpenAsync(_contract.Id, cancellationToken))
+            {
+                await FinalizeManagedPositionCloseAsync(trade, cancellationToken);
+                await journal.WriteAsync(
+                    closeSubmitted
+                        ? $"position-close-confirmed:{reason}"
+                        : $"position-close-skipped:{reason}; position-not-open",
+                    cancellationToken);
+                return;
+            }
+
+            try
+            {
+                await topstep.ClosePositionAsync(_account.Id, _contract.Id, cancellationToken);
+                closeSubmitted = true;
+                await journal.WriteAsync($"position-close-submitted:{reason}; attempt={attempt + 1}", cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                await journal.WriteAsync(
+                    $"position-close-failed:{reason}; attempt={attempt + 1}; {exception.GetType().Name}:{exception.Message}",
+                    cancellationToken);
+            }
         }
-        catch (Exception exception)
+
+        await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+        if (!await IsContractPositionOpenAsync(_contract.Id, cancellationToken))
         {
-            await journal.WriteAsync($"position-close-failed:{reason}; {exception.GetType().Name}:{exception.Message}", cancellationToken);
+            await FinalizeManagedPositionCloseAsync(trade, cancellationToken);
+            await journal.WriteAsync(
+                closeSubmitted
+                    ? $"position-close-confirmed:{reason}"
+                    : $"position-close-skipped:{reason}; position-not-open",
+                cancellationToken);
+            return;
         }
+
+        await journal.WriteAsync($"position-close-unconfirmed:{reason}", cancellationToken);
     }
 
     private async Task CloseAdditionalContractAsync(string contractId, CancellationToken cancellationToken)
@@ -910,25 +932,67 @@ public sealed class Worker(
             return;
         }
 
-        try
+        var closeSubmitted = false;
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            await topstep.ClosePositionAsync(_account.Id, contractId, cancellationToken);
-            for (var attempt = 0; attempt < 3; attempt++)
+            if (attempt > 0)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
-                if (!(await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-                    .Any(position => position.ContractId == contractId))
-                {
-                    await journal.WriteAsync($"position-close-confirmed:4pm-et-session-close; contract={contractId}", cancellationToken);
-                    return;
-                }
             }
 
-            await journal.WriteAsync($"position-close-unconfirmed:4pm-et-session-close; contract={contractId}", cancellationToken);
+            if (!await IsContractPositionOpenAsync(contractId, cancellationToken))
+            {
+                await journal.WriteAsync(
+                    closeSubmitted
+                        ? $"position-close-confirmed:4pm-et-session-close; contract={contractId}"
+                        : $"position-close-skipped:4pm-et-session-close; contract={contractId}; position-not-open",
+                    cancellationToken);
+                return;
+            }
+
+            try
+            {
+                await topstep.ClosePositionAsync(_account.Id, contractId, cancellationToken);
+                closeSubmitted = true;
+                await journal.WriteAsync(
+                    $"position-close-submitted:4pm-et-session-close; contract={contractId}; attempt={attempt + 1}",
+                    cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                await journal.WriteAsync(
+                    $"position-close-failed:4pm-et-session-close; contract={contractId}; attempt={attempt + 1}; {exception.GetType().Name}:{exception.Message}",
+                    cancellationToken);
+            }
         }
-        catch (Exception exception)
+
+        await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+        if (!await IsContractPositionOpenAsync(contractId, cancellationToken))
         {
-            await journal.WriteAsync($"position-close-failed:4pm-et-session-close; contract={contractId}; {exception.GetType().Name}:{exception.Message}", cancellationToken);
+            await journal.WriteAsync(
+                closeSubmitted
+                    ? $"position-close-confirmed:4pm-et-session-close; contract={contractId}"
+                    : $"position-close-skipped:4pm-et-session-close; contract={contractId}; position-not-open",
+                cancellationToken);
+            return;
+        }
+
+        await journal.WriteAsync($"position-close-unconfirmed:4pm-et-session-close; contract={contractId}", cancellationToken);
+    }
+
+    private async Task<bool> IsContractPositionOpenAsync(string contractId, CancellationToken cancellationToken) =>
+        _account is not null &&
+        (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+        .Any(position => position.ContractId == contractId);
+
+    private async Task FinalizeManagedPositionCloseAsync(TradeState? trade, CancellationToken cancellationToken)
+    {
+        await ReconcileExecutionsAsync(trade, cancellationToken);
+        if (_session is not null)
+        {
+            _session.Trade = null;
+            _session.PendingEntryDirection = null;
+            await sessionStore.SaveAsync(_session, cancellationToken);
         }
     }
 
