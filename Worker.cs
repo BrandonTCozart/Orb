@@ -350,13 +350,16 @@ public sealed class Worker(
             _contract.Id,
             position.Size,
             entryPrice,
-            initialStop,
+            initialStop.Stop,
             references.Intraday,
             references.PreviousDay);
         _session.PendingEntryDirection = null;
         _session.PendingEntryOrderId = null;
 
-        if (!await EnsureProtectiveStopAsync(initialStop, "initial-stop", quote.LastPrice, cancellationToken))
+        await journal.WriteAsync(
+            $"initial-stop-calculated:orb-high={_openingRange.High}; orb-low={_openingRange.Low}; entry={entryPrice}; calculated-stop={initialStop.Stop}; estimated-risk={initialStop.EstimatedRisk}; fallback-used={initialStop.UsedFallback}",
+            cancellationToken);
+        if (!await EnsureProtectiveStopAsync(initialStop.Stop, "initial-stop", quote.LastPrice, cancellationToken))
         {
             return;
         }
@@ -728,6 +731,9 @@ public sealed class Worker(
 
         try
         {
+            await journal.WriteAsync(
+                $"stop-adjustment-attempted:{reason}; action={(trade.StopOrderId is null ? "place" : "modify")}; order={trade.StopOrderId}; price={requestedStop}",
+                cancellationToken);
             if (trade.StopOrderId is null)
             {
                 var response = await topstep.PlaceOrderAsync(
@@ -748,7 +754,7 @@ public sealed class Worker(
 
             if (await ConfirmStopAsync(trade, requestedStop, cancellationToken))
             {
-                await journal.WriteAsync($"stop-confirmed:{reason}; order={trade.StopOrderId}; price={requestedStop}", cancellationToken);
+                await journal.WriteAsync($"stop-adjustment-confirmed:{reason}; order={trade.StopOrderId}; price={requestedStop}", cancellationToken);
                 return true;
             }
         }
