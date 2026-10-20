@@ -689,14 +689,6 @@ public sealed class Worker(
             return false;
         }
 
-        var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-            .SingleOrDefault(item => item.ContractId == _contract.Id);
-        if (position is null || !MatchesTradePosition(position, trade))
-        {
-            await ClosePositionAsync($"position-mismatch-before-{reason}", cancellationToken);
-            return false;
-        }
-
         requestedStop = trade.Direction == TradeDirection.Long
             ? Math.Floor(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize
             : Math.Ceiling(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize;
@@ -705,6 +697,14 @@ public sealed class Worker(
             !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
         {
             return true;
+        }
+
+        var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
+            .SingleOrDefault(item => item.ContractId == _contract.Id);
+        if (position is null || !MatchesTradePosition(position, trade))
+        {
+            await ClosePositionAsync($"position-mismatch-before-{reason}", cancellationToken);
+            return false;
         }
 
         var existingStops = await GetContractStopOrdersAsync(cancellationToken);
