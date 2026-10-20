@@ -638,7 +638,8 @@ public sealed class Worker(
             _openingRange is null ||
             _session.Trade is not null ||
             _session.PendingEntryDirection is not null ||
-            (!_session.Stage6Eligible && _session.TradeSubmitted) ||
+            (_session.TradeSubmitted &&
+             (!options.Value.EnableStage6ReversalTrade || !_session.Stage6Eligible)) ||
             _session.Stage6Submitted ||
             (_session.LastEntryCandle is not null && candle.T <= _session.LastEntryCandle))
         {
@@ -658,7 +659,13 @@ public sealed class Worker(
         {
             var candleClose = MarketTime.ToEastern(candle.T).AddMinutes(1);
             var cutoff = MarketTime.ToEastern(MarketTime.ToUtc(_session.TradingDate, new TimeOnly(13, 0)));
-            var oppositeDirection = _session.Stage6OriginalDirection is TradeDirection.Long
+            if (_session.Stage6OriginalDirection is not TradeDirection originalDirection)
+            {
+                await sessionStore.SaveAsync(_session, cancellationToken);
+                return;
+            }
+
+            var oppositeDirection = originalDirection == TradeDirection.Long
                 ? TradeDirection.Short
                 : TradeDirection.Long;
             if (candleClose < cutoff &&

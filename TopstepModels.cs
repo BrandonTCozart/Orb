@@ -208,7 +208,7 @@ public sealed class TradeState
     public string ContractId { get; init; } = string.Empty;
     public decimal EntryPrice { get; init; }
     public long? EntryOrderId { get; init; }
-    public decimal PointValue { get; init; }
+    public decimal PointValue { get; init; } = 50m;
     public bool IsStage6 { get; init; }
     public decimal InitialStop { get; init; }
     public long? StopOrderId { get; set; }
