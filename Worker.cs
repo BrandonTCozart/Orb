@@ -76,6 +76,10 @@ public sealed class Worker(
                 _mesContract ??= await topstep.GetActiveMesContractAsync(cancellationToken);
             }
             await marketData.EnsureStartedAsync(_contract.Id, cancellationToken);
+            if (_mesContract is not null)
+            {
+                await marketData.EnsureStartedAsync(_mesContract.Id, cancellationToken);
+            }
 
             if (easternNow.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
             {
@@ -235,7 +239,7 @@ public sealed class Worker(
 
         if (!await ConfirmExistingStopAsync(_session.Trade, cancellationToken))
         {
-            if (marketData.LastQuote is not { LastPrice: > 0 } recoveryQuote ||
+            if (marketData.GetLastQuote(_session.Trade.ContractId) is not { LastPrice: > 0 } recoveryQuote ||
                 !await EnsureProtectiveStopAsync(
                     _session.Trade.InitialStop,
                     "recovery-initial-stop",
@@ -248,7 +252,7 @@ public sealed class Worker(
             return;
         }
 
-        if (marketData.LastQuote is not { LastPrice: > 0 } quote)
+        if (marketData.GetLastQuote(_session.Trade.ContractId) is not { LastPrice: > 0 } quote)
         {
             await journal.WriteAsync("recovered-position:waiting-for-market-quote", cancellationToken);
             await sessionStore.SaveAsync(_session, cancellationToken);
@@ -348,7 +352,7 @@ public sealed class Worker(
             return;
         }
 
-        if (marketData.LastQuote is not { LastPrice: > 0 } quote)
+        if (marketData.GetLastQuote(entryContract.Id) is not { LastPrice: > 0 } quote)
         {
             await ClosePositionAsync("entry-filled-without-current-quote", cancellationToken);
             return;
@@ -525,7 +529,7 @@ public sealed class Worker(
         return position.AveragePrice;
     }
 
-    private async Task ProcessQuoteAsync(Quote quote)
+    private async Task ProcessQuoteAsync(string contractId, Quote quote)
     {
         if (quote.LastPrice <= 0)
         {
@@ -535,8 +539,14 @@ public sealed class Worker(
         await _stateLock.WaitAsync();
         try
         {
-            await UpdateLiveCandleAsync(quote, CancellationToken.None);
-            if (_session?.Trade is not null && _openingRange is not null)
+            if (_contract?.Id == contractId)
+            {
+                await UpdateLiveCandleAsync(quote, CancellationToken.None);
+            }
+
+            if (_session?.Trade is TradeState trade &&
+                _openingRange is not null &&
+                trade.ContractId == contractId)
             {
                 await ProcessTradeAsync(quote.LastPrice, CancellationToken.None);
             }
@@ -1072,6 +1082,11 @@ public sealed class Worker(
     private async Task FinalizeManagedPositionCloseAsync(TradeState? trade, CancellationToken cancellationToken)
     {
         await ReconcileExecutionsAsync(trade, cancellationToken);
+        if (trade is not null)
+        {
+            await EvaluateStage6EligibilityAsync(trade, cancellationToken);
+        }
+
         if (_session is not null)
         {
             _session.Trade = null;
