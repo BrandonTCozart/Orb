@@ -7,6 +7,10 @@ public sealed class OrbStrategy
     public const decimal MaxInitialRisk = 600m;
     public const decimal DefaultInitialStopRisk = 500m;
     public const int EntryQuantity = 1;
+    public const decimal Stage6MaxInitialRisk = 300m;
+    public const decimal Stage6DefaultInitialStopRisk = 250m;
+    public const int Stage6EntryQuantity = 5;
+    public const decimal MesPointValue = 5m;
 
     public OpeningRange? GetOpeningRange(IEnumerable<Candle> candles, DateOnly tradingDate)
     {
@@ -98,7 +102,10 @@ public sealed class OrbStrategy
         decimal entryPrice,
         decimal initialStop,
         decimal? intradayLevel,
-        decimal? previousDayLevel)
+        decimal? previousDayLevel,
+        long? entryOrderId,
+        decimal pointValue,
+        bool isStage6)
     {
         var references = new List<ReferenceLevel>();
         AddReference(references, "intraday", intradayLevel, direction, entryPrice);
@@ -109,6 +116,9 @@ public sealed class OrbStrategy
             ContractId = contractId,
             Quantity = quantity,
             EntryPrice = entryPrice,
+            EntryOrderId = entryOrderId,
+            PointValue = pointValue,
+            IsStage6 = isStage6,
             InitialStop = initialStop,
             PeakProfit = 0,
             ReferenceLevels = references
@@ -119,13 +129,17 @@ public sealed class OrbStrategy
         TradeDirection direction,
         decimal entryPrice,
         OpeningRange openingRange,
-        decimal allowance)
+        decimal allowance,
+        decimal pointValue = EsPointValue,
+        int quantity = EntryQuantity,
+        decimal maxInitialRisk = MaxInitialRisk,
+        decimal defaultInitialStopRisk = DefaultInitialStopRisk)
     {
         var orbStop = RoundStop(direction, direction == TradeDirection.Long
             ? openingRange.High - (openingRange.Width * .75m)
             : openingRange.Low + (openingRange.Width * .75m));
-        var orbRisk = GetInitialRisk(entryPrice, orbStop, allowance);
-        if (orbRisk <= MaxInitialRisk)
+        var orbRisk = GetInitialRisk(entryPrice, orbStop, allowance, pointValue, quantity);
+        if (orbRisk <= maxInitialRisk)
         {
             return new InitialStopCalculation
             {
@@ -137,12 +151,12 @@ public sealed class OrbStrategy
         var fallbackStop = RoundStop(
             direction,
             direction == TradeDirection.Long
-                ? entryPrice - (DefaultInitialStopRisk / EsPointValue)
-                : entryPrice + (DefaultInitialStopRisk / EsPointValue));
+                ? entryPrice - (defaultInitialStopRisk / (pointValue * quantity))
+                : entryPrice + (defaultInitialStopRisk / (pointValue * quantity)));
         return new InitialStopCalculation
         {
             Stop = fallbackStop,
-            EstimatedRisk = GetInitialRisk(entryPrice, fallbackStop, allowance),
+            EstimatedRisk = GetInitialRisk(entryPrice, fallbackStop, allowance, pointValue, quantity),
             UsedFallback = true
         };
     }
@@ -159,7 +173,7 @@ public sealed class OrbStrategy
         if (trade.CompletedStage == 2)
         {
             var reference = GetReachedUnusedReference(trade, marketPrice);
-            if (profit < 250m && reference is null)
+            if (profit < GetStage3ProfitThreshold(trade) && reference is null)
             {
                 return null;
             }
@@ -167,7 +181,7 @@ public sealed class OrbStrategy
             return new StageAction
             {
                 Stage = 3,
-                Reason = BuildReason("stage-3", profit >= 250m, reference),
+                Reason = BuildReason("stage-3", profit >= GetStage3ProfitThreshold(trade), reference),
                 ReferencePrice = reference?.Price,
                 DesiredStop = GetStage3Stop(trade, marketPrice, openingRange, candles)
             };
@@ -176,12 +190,14 @@ public sealed class OrbStrategy
         if (trade.CompletedStage == 3)
         {
             var reference = GetReachedUnusedReference(trade, marketPrice);
-            if (profit < 500m && reference is null)
+            if (profit < GetStage4ProfitThreshold(trade) && reference is null)
             {
                 return null;
             }
 
-            decimal? profitTarget = profit >= 500m ? ProfitToPrice(trade, 250m) : null;
+            decimal? profitTarget = profit >= GetStage4ProfitThreshold(trade)
+                ? ProfitToPrice(trade, GetStage3ProfitThreshold(trade))
+                : null;
             var referenceTarget = reference is null
                 ? null
                 : GetReferenceFvgStop(trade, marketPrice, openingRange, reference.Price, candles);
@@ -189,7 +205,7 @@ public sealed class OrbStrategy
             return new StageAction
             {
                 Stage = 4,
-                Reason = BuildReason("stage-4", profit >= 500m, reference),
+                Reason = BuildReason("stage-4", profit >= GetStage4ProfitThreshold(trade), reference),
                 ReferencePrice = reference?.Price,
                 DesiredStop = MoreProtective(trade.Direction, profitTarget, referenceTarget)
             };
@@ -226,10 +242,15 @@ public sealed class OrbStrategy
 
     public decimal GetProfit(TradeState trade, decimal price) =>
         (trade.Direction == TradeDirection.Long ? price - trade.EntryPrice : trade.EntryPrice - price)
-        * EsPointValue * trade.Quantity;
+        * trade.PointValue * trade.Quantity;
 
-    private static decimal GetInitialRisk(decimal entryPrice, decimal stopPrice, decimal allowance) =>
-        Math.Abs(entryPrice - stopPrice) * EsPointValue + allowance;
+    private static decimal GetInitialRisk(
+        decimal entryPrice,
+        decimal stopPrice,
+        decimal allowance,
+        decimal pointValue,
+        int quantity) =>
+        Math.Abs(entryPrice - stopPrice) * pointValue * quantity + allowance;
 
     public bool IsValidProtectiveStop(TradeState trade, decimal stop, decimal marketPrice) =>
         trade.Direction == TradeDirection.Long ? stop < marketPrice : stop > marketPrice;
@@ -245,16 +266,18 @@ public sealed class OrbStrategy
         }
 
         decimal? desiredProfit = null;
-        if (trade.PeakProfit >= 1000m)
+        var continuousTrailThreshold = trade.IsStage6 ? 500m : 1000m;
+        var trailingDistance = trade.IsStage6 ? 125m : 250m;
+        if (trade.PeakProfit >= continuousTrailThreshold)
         {
-            desiredProfit = trade.PeakProfit - 250m;
+            desiredProfit = trade.PeakProfit - trailingDistance;
         }
         else
         {
-            var increments = (int)Math.Floor((trade.PeakProfit - stage4Peak) / 250m);
+            var increments = (int)Math.Floor((trade.PeakProfit - stage4Peak) / trailingDistance);
             if (increments > 0)
             {
-                desiredProfit = secured + (increments * 250m);
+                desiredProfit = secured + (increments * trailingDistance);
             }
         }
 
@@ -263,7 +286,7 @@ public sealed class OrbStrategy
             : new StageAction
             {
                 Stage = 5,
-                Reason = trade.PeakProfit >= 1000m ? "stage-5-continuous-trail" : "stage-5-incremental-trail",
+                Reason = trade.PeakProfit >= continuousTrailThreshold ? "stage-5-continuous-trail" : "stage-5-incremental-trail",
                 DesiredStop = RoundStop(trade.Direction, ProfitToPrice(trade, desiredProfit.Value))
             };
     }
@@ -530,8 +553,12 @@ public sealed class OrbStrategy
 
     private static decimal ProfitToPrice(TradeState trade, decimal profit) =>
         trade.Direction == TradeDirection.Long
-            ? trade.EntryPrice + (profit / (EsPointValue * trade.Quantity))
-            : trade.EntryPrice - (profit / (EsPointValue * trade.Quantity));
+            ? trade.EntryPrice + (profit / (trade.PointValue * trade.Quantity))
+            : trade.EntryPrice - (profit / (trade.PointValue * trade.Quantity));
+
+    private static decimal GetStage3ProfitThreshold(TradeState trade) => trade.IsStage6 ? 125m : 250m;
+
+    private static decimal GetStage4ProfitThreshold(TradeState trade) => trade.IsStage6 ? 250m : 500m;
 
     private static decimal RoundStop(TradeDirection direction, decimal price) =>
         direction == TradeDirection.Long

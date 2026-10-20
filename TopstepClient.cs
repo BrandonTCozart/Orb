@@ -98,6 +98,19 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
                ?? throw new InvalidOperationException("No active E-mini S&P 500 contract is available.");
     }
 
+    public async Task<TopstepContract> GetActiveMesContractAsync(CancellationToken cancellationToken)
+    {
+        var result = await PostAsync<ContractResponse>(
+            "/api/Contract/available", new { live = options.Value.Live }, cancellationToken);
+
+        return result.Contracts.SingleOrDefault(contract =>
+                  contract.ActiveContract &&
+                  contract.SymbolId == "F.US.MES" &&
+                  contract.TickSize == 0.25m &&
+                  contract.TickValue == 1.25m)
+               ?? throw new InvalidOperationException("No active Micro E-mini S&P 500 contract is available.");
+    }
+
     public async Task<IReadOnlyList<Candle>> GetMinuteBarsAsync(
         string contractId,
         DateTimeOffset start,
