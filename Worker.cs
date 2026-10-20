@@ -689,6 +689,16 @@ public sealed class Worker(
             return false;
         }
 
+        requestedStop = trade.Direction == TradeDirection.Long
+            ? Math.Floor(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize
+            : Math.Ceiling(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize;
+
+        if (trade.ConfirmedStop is decimal currentStop &&
+            !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
+        {
+            return true;
+        }
+
         var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
             .SingleOrDefault(item => item.ContractId == _contract.Id);
         if (position is null || !MatchesTradePosition(position, trade))
@@ -696,10 +706,6 @@ public sealed class Worker(
             await ClosePositionAsync($"position-mismatch-before-{reason}", cancellationToken);
             return false;
         }
-
-        requestedStop = trade.Direction == TradeDirection.Long
-            ? Math.Floor(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize
-            : Math.Ceiling(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize;
 
         var existingStops = await GetContractStopOrdersAsync(cancellationToken);
         if (existingStops.Length > 1 ||
@@ -714,12 +720,6 @@ public sealed class Worker(
         if (existingStops.Length == 1 && trade.StopOrderId is null)
         {
             trade.StopOrderId = existingStops[0].Id;
-        }
-
-        if (trade.ConfirmedStop is decimal currentStop &&
-            !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
-        {
-            return await ConfirmExistingStopAsync(trade, cancellationToken);
         }
 
         if (!strategy.IsValidProtectiveStop(trade, requestedStop, marketPrice))

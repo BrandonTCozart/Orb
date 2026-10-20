@@ -7,9 +7,14 @@ namespace Orb;
 
 public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions> options)
 {
+    private const int MaximumRateLimitRetries = 2;
+    private static readonly TimeSpan MinimumRequestInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan DefaultRateLimitDelay = TimeSpan.FromSeconds(1);
     private readonly SemaphoreSlim _authenticationLock = new(1, 1);
+    private readonly SemaphoreSlim _requestRateLock = new(1, 1);
     private string? _sessionToken;
     private DateTimeOffset _sessionExpiry;
+    private DateTimeOffset _nextRequestAt;
 
     public async Task<string> GetSessionTokenAsync(CancellationToken cancellationToken, bool forceLogin = false)
     {
@@ -203,15 +208,24 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
     {
         var token = await GetSessionTokenAsync(cancellationToken);
         T response;
-        try
+        var retryUnauthorized = true;
+        for (var rateLimitAttempt = 0; ; rateLimitAttempt++)
         {
-            response = await PostUnauthenticatedAsync<T>(path, payload, token, cancellationToken);
-        }
-        catch (UnauthorizedAccessException)
-        {
-            var rejectedCurrentToken = await InvalidateSessionTokenAsync(token, cancellationToken);
-            token = await GetSessionTokenAsync(cancellationToken, rejectedCurrentToken);
-            response = await PostUnauthenticatedAsync<T>(path, payload, token, cancellationToken);
+            try
+            {
+                response = await PostUnauthenticatedAsync<T>(path, payload, token, cancellationToken);
+                break;
+            }
+            catch (UnauthorizedAccessException) when (retryUnauthorized)
+            {
+                retryUnauthorized = false;
+                var rejectedCurrentToken = await InvalidateSessionTokenAsync(token, cancellationToken);
+                token = await GetSessionTokenAsync(cancellationToken, rejectedCurrentToken);
+            }
+            catch (TopstepRateLimitException exception) when (rateLimitAttempt < MaximumRateLimitRetries)
+            {
+                await Task.Delay(exception.RetryAfter, cancellationToken);
+            }
         }
 
         if (response.Success)
@@ -239,16 +253,67 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         }
 
+        await WaitForRequestSlotAsync(cancellationToken);
         using var response = await httpClient.SendAsync(request, cancellationToken);
         if (response.StatusCode == HttpStatusCode.Unauthorized)
         {
             throw new UnauthorizedAccessException("Topstep session token expired or was rejected.");
         }
 
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = GetRetryAfter(response.Headers.RetryAfter);
+            await DeferRequestsAsync(retryAfter, cancellationToken);
+            throw new TopstepRateLimitException(path, retryAfter);
+        }
+
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<T>(cancellationToken: cancellationToken)
                ?? throw new InvalidOperationException($"Topstep {path} returned an empty response.");
     }
+
+    private async Task WaitForRequestSlotAsync(CancellationToken cancellationToken)
+    {
+        await _requestRateLock.WaitAsync(cancellationToken);
+        try
+        {
+            var delay = _nextRequestAt - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+
+            _nextRequestAt = DateTimeOffset.UtcNow.Add(MinimumRequestInterval);
+        }
+        finally
+        {
+            _requestRateLock.Release();
+        }
+    }
+
+    private async Task DeferRequestsAsync(TimeSpan delay, CancellationToken cancellationToken)
+    {
+        await _requestRateLock.WaitAsync(cancellationToken);
+        try
+        {
+            _nextRequestAt = Max(_nextRequestAt, DateTimeOffset.UtcNow.Add(delay));
+        }
+        finally
+        {
+            _requestRateLock.Release();
+        }
+    }
+
+    private static TimeSpan GetRetryAfter(RetryConditionHeaderValue? retryAfterHeader)
+    {
+        var retryAfter = retryAfterHeader?.Delta ??
+            (retryAfterHeader?.Date is DateTimeOffset retryAt ? (TimeSpan?)(retryAt - DateTimeOffset.UtcNow) : null) ??
+            DefaultRateLimitDelay;
+        return retryAfter > TimeSpan.Zero ? retryAfter : MinimumRequestInterval;
+    }
+
+    private static DateTimeOffset Max(DateTimeOffset first, DateTimeOffset second) =>
+        first >= second ? first : second;
 
     private async Task<bool> InvalidateSessionTokenAsync(string rejectedToken, CancellationToken cancellationToken)
     {
@@ -268,5 +333,11 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
         {
             _authenticationLock.Release();
         }
+    }
+
+    private sealed class TopstepRateLimitException(string path, TimeSpan retryAfter)
+        : Exception($"Topstep {path} rate limited the request.")
+    {
+        public TimeSpan RetryAfter { get; } = retryAfter;
     }
 }
