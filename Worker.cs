@@ -15,6 +15,7 @@ public sealed class Worker(
     private OrbSessionState? _session;
     private TopstepAccount? _account;
     private TopstepContract? _contract;
+    private TopstepContract? _mesContract;
     private OpeningRange? _openingRange;
     private IReadOnlyList<Candle> _candles = [];
     private DateTimeOffset? _lastHistoryMinute;
@@ -70,6 +71,10 @@ public sealed class Worker(
 
             _account ??= await topstep.GetTradingAccountAsync(cancellationToken);
             _contract ??= await topstep.GetActiveEsContractAsync(cancellationToken);
+            if (options.Value.EnableStage6ReversalTrade)
+            {
+                _mesContract ??= await topstep.GetActiveMesContractAsync(cancellationToken);
+            }
             await marketData.EnsureStartedAsync(_contract.Id, cancellationToken);
 
             if (easternNow.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
@@ -175,11 +180,15 @@ public sealed class Worker(
             return;
         }
 
+        var managedContractIds = new[] { _contract.Id, _mesContract?.Id }
+            .Where(contractId => contractId is not null)
+            .Cast<string>()
+            .ToArray();
         var positions = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-            .Where(item => item.ContractId == _contract.Id)
+            .Where(item => managedContractIds.Contains(item.ContractId))
             .ToArray();
         var openOrders = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
-            .Where(order => order.ContractId == _contract.Id)
+            .Where(order => managedContractIds.Contains(order.ContractId))
             .ToArray();
         if (positions.Length > 1)
         {
@@ -209,8 +218,10 @@ public sealed class Worker(
 
         if (position is null)
         {
-            await ReconcileExecutionsAsync(_session.Trade, cancellationToken);
-            await journal.WriteAsync($"position-closed:entry={_session.Trade.EntryPrice}; peak-profit={_session.Trade.PeakProfit}", cancellationToken);
+            var closedTrade = _session.Trade;
+            await ReconcileExecutionsAsync(closedTrade, cancellationToken);
+            await EvaluateStage6EligibilityAsync(closedTrade, cancellationToken);
+            await journal.WriteAsync($"position-closed:entry={closedTrade.EntryPrice}; peak-profit={closedTrade.PeakProfit}", cancellationToken);
             _session.Trade = null;
             await sessionStore.SaveAsync(_session, cancellationToken);
             return;
@@ -258,31 +269,45 @@ public sealed class Worker(
         TradeDirection direction,
         Candle breakoutCandle,
         DateOnly tradingDate,
+        bool isStage6,
         CancellationToken cancellationToken)
     {
-        if (_session is null || _contract is null || _account is null || _openingRange is null)
+        var entryContract = isStage6 ? _mesContract : _contract;
+        var quantity = isStage6 ? OrbStrategy.Stage6EntryQuantity : OrbStrategy.EntryQuantity;
+        if (_session is null || entryContract is null || _account is null || _openingRange is null)
         {
             return;
         }
 
-        _session.TradeSubmitted = true;
+        if (isStage6)
+        {
+            _session.Stage6Submitted = true;
+            _session.Stage6Eligible = false;
+        }
+        else
+        {
+            _session.TradeSubmitted = true;
+        }
         _session.PendingEntryDirection = direction;
+        _session.PendingEntryContractId = entryContract.Id;
+        _session.PendingEntryQuantity = quantity;
+        _session.PendingEntryIsStage6 = isStage6;
         await sessionStore.SaveAsync(_session, cancellationToken);
-        var tag = $"orb-{tradingDate:yyyyMMdd}-entry";
+        var tag = $"orb-{tradingDate:yyyyMMdd}-{(isStage6 ? "stage6" : "entry")}";
         try
         {
             var order = await topstep.PlaceOrderAsync(
                 _account.Id,
-                _contract.Id,
+                entryContract.Id,
                 type: 2,
                 side: direction == TradeDirection.Long ? 0 : 1,
-                size: OrbStrategy.EntryQuantity,
+                size: quantity,
                 stopPrice: null,
                 customTag: tag,
                 cancellationToken);
             _session.PendingEntryOrderId = order.OrderId;
             await sessionStore.SaveAsync(_session, cancellationToken);
-            await journal.WriteAsync($"entry-submitted:order={order.OrderId}; direction={direction}; size={OrbStrategy.EntryQuantity}; signal-close={breakoutCandle.C}", cancellationToken);
+            await journal.WriteAsync($"entry-submitted:order={order.OrderId}; stage6={isStage6}; direction={direction}; size={quantity}; signal-close={breakoutCandle.C}", cancellationToken);
 
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
             await ActivateFilledEntryAsync(direction, cancellationToken);
@@ -295,13 +320,22 @@ public sealed class Worker(
 
     private async Task ActivateFilledEntryAsync(TradeDirection direction, CancellationToken cancellationToken)
     {
-        if (_session is null || _contract is null || _account is null)
+        if (_session is null || _account is null ||
+            string.IsNullOrWhiteSpace(_session.PendingEntryContractId) ||
+            _session.PendingEntryQuantity is not int expectedQuantity)
+        {
+            return;
+        }
+
+        var isStage6 = _session.PendingEntryIsStage6;
+        var entryContract = isStage6 ? _mesContract : _contract;
+        if (entryContract is null || entryContract.Id != _session.PendingEntryContractId)
         {
             return;
         }
 
         var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-            .SingleOrDefault(item => item.ContractId == _contract.Id);
+            .SingleOrDefault(item => item.ContractId == entryContract.Id);
         if (position is null)
         {
             await journal.WriteAsync("entry-pending:no-position-confirmation", cancellationToken);
@@ -327,18 +361,24 @@ public sealed class Worker(
             return;
         }
 
-        if (position.Size != OrbStrategy.EntryQuantity)
+        if (position.Size != expectedQuantity)
         {
-            await ClosePositionAsync("entry-size-not-one-contract", cancellationToken);
+            await ClosePositionAsync("entry-size-mismatch", cancellationToken);
             return;
         }
 
-        var entryPrice = await GetActualEntryPriceAsync(direction, position, cancellationToken);
+        var entryPrice = await GetActualEntryPriceAsync(direction, position, entryContract.Id, cancellationToken);
+        var allowance = options.Value.CommissionAndSlippagePerContract * position.Size;
+        var pointValue = entryContract.TickValue / entryContract.TickSize;
         var initialStop = strategy.CalculateInitialStop(
             direction,
             entryPrice,
             _openingRange,
-            options.Value.CommissionAndSlippagePerContract);
+            allowance,
+            pointValue,
+            position.Size,
+            isStage6 ? OrbStrategy.Stage6MaxInitialRisk : OrbStrategy.MaxInitialRisk,
+            isStage6 ? OrbStrategy.Stage6DefaultInitialStopRisk : OrbStrategy.DefaultInitialStopRisk);
 
         var date = _session.TradingDate;
         var references = direction == TradeDirection.Long
@@ -346,17 +386,23 @@ public sealed class Worker(
             : _shortReferenceLevels ?? strategy.GetShortReferenceLevels(_candles, date);
         _session.Trade = strategy.CreateTrade(
             direction,
-            _contract.Id,
+            entryContract.Id,
             position.Size,
             entryPrice,
             initialStop.Stop,
             references.Intraday,
-            references.PreviousDay);
+            references.PreviousDay,
+            _session.PendingEntryOrderId,
+            pointValue,
+            isStage6);
         _session.PendingEntryDirection = null;
         _session.PendingEntryOrderId = null;
+        _session.PendingEntryContractId = null;
+        _session.PendingEntryQuantity = null;
+        _session.PendingEntryIsStage6 = false;
 
         await journal.WriteAsync(
-            $"initial-stop-calculated:orb-high={_openingRange.High}; orb-low={_openingRange.Low}; entry={entryPrice}; calculated-stop={initialStop.Stop}; estimated-risk={initialStop.EstimatedRisk}; fallback-used={initialStop.UsedFallback}",
+            $"initial-stop-calculated:stage6={isStage6}; orb-high={_openingRange.High}; orb-low={_openingRange.Low}; entry={entryPrice}; calculated-stop={initialStop.Stop}; estimated-risk={initialStop.EstimatedRisk}; fallback-used={initialStop.UsedFallback}",
             cancellationToken);
         if (!await EnsureProtectiveStopAsync(initialStop.Stop, "initial-stop", quote.LastPrice, cancellationToken))
         {
@@ -373,15 +419,17 @@ public sealed class Worker(
         IReadOnlyList<TopstepOrder> openOrders,
         CancellationToken cancellationToken)
     {
-        if (_session is null || _account is null || _contract is null ||
+        if (_session is null || _account is null ||
+            string.IsNullOrWhiteSpace(_session.PendingEntryContractId) ||
             _session.PendingEntryDirection is not TradeDirection direction)
         {
             return;
         }
 
-        var tag = $"orb-{_session.TradingDate:yyyyMMdd}-entry";
+        var tag = $"orb-{_session.TradingDate:yyyyMMdd}-{(_session.PendingEntryIsStage6 ? "stage6" : "entry")}";
         var pendingOrders = openOrders
             .Where(order => order.Type == 2 &&
+                            order.ContractId == _session.PendingEntryContractId &&
                             (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
             .ToArray();
         foreach (var order in pendingOrders)
@@ -394,7 +442,7 @@ public sealed class Worker(
         {
             await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
             var remainingPendingOrders = (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
-                .Where(order => order.ContractId == _contract.Id &&
+                .Where(order => order.ContractId == _session.PendingEntryContractId &&
                                 order.Type == 2 &&
                                 (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
                 .ToArray();
@@ -407,7 +455,7 @@ public sealed class Worker(
             }
 
             var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-                .SingleOrDefault(item => item.ContractId == _contract.Id);
+                .SingleOrDefault(item => item.ContractId == _session.PendingEntryContractId);
             if (position is not null)
             {
                 await ActivateFilledEntryAsync(direction, cancellationToken);
@@ -420,7 +468,7 @@ public sealed class Worker(
                 MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue),
                 DateTimeOffset.UtcNow,
                 cancellationToken))
-            .Where(order => order.ContractId == _contract.Id &&
+            .Where(order => order.ContractId == _session.PendingEntryContractId &&
                             (order.Id == _session.PendingEntryOrderId || order.CustomTag == tag))
             .OrderByDescending(order => order.CreationTimestamp)
             .ToArray();
@@ -438,15 +486,19 @@ public sealed class Worker(
             cancellationToken);
         _session.PendingEntryDirection = null;
         _session.PendingEntryOrderId = null;
+        _session.PendingEntryContractId = null;
+        _session.PendingEntryQuantity = null;
+        _session.PendingEntryIsStage6 = false;
         await sessionStore.SaveAsync(_session, cancellationToken);
     }
 
     private async Task<decimal> GetActualEntryPriceAsync(
         TradeDirection direction,
         TopstepPosition position,
+        string contractId,
         CancellationToken cancellationToken)
     {
-        if (_session is null || _account is null || _contract is null)
+        if (_session is null || _account is null)
         {
             return position.AveragePrice;
         }
@@ -456,7 +508,7 @@ public sealed class Worker(
                 MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue),
                 DateTimeOffset.UtcNow,
                 cancellationToken))
-            .Where(execution => execution.ContractId == _contract.Id &&
+            .Where(execution => execution.ContractId == contractId &&
                                 execution.Side == (direction == TradeDirection.Long ? 0 : 1) &&
                                 (_session.PendingEntryOrderId is null ||
                                  execution.OrderId == _session.PendingEntryOrderId))
@@ -585,7 +637,9 @@ public sealed class Worker(
         if (_session is null ||
             _openingRange is null ||
             _session.Trade is not null ||
-            _session.TradeSubmitted ||
+            _session.PendingEntryDirection is not null ||
+            (!_session.Stage6Eligible && _session.TradeSubmitted) ||
+            _session.Stage6Submitted ||
             (_session.LastEntryCandle is not null && candle.T <= _session.LastEntryCandle))
         {
             return;
@@ -600,9 +654,31 @@ public sealed class Worker(
         }
 
         var direction = strategy.GetBreakout(candle, _openingRange);
+        if (_session.Stage6Eligible)
+        {
+            var candleClose = MarketTime.ToEastern(candle.T).AddMinutes(1);
+            var cutoff = MarketTime.ToEastern(MarketTime.ToUtc(_session.TradingDate, new TimeOnly(13, 0)));
+            var oppositeDirection = _session.Stage6OriginalDirection is TradeDirection.Long
+                ? TradeDirection.Short
+                : TradeDirection.Long;
+            if (candleClose < cutoff &&
+                _session.Stage6EligibleAt is DateTimeOffset eligibleAt &&
+                candleClose > MarketTime.ToEastern(eligibleAt) &&
+                direction == oppositeDirection)
+            {
+                await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, true, cancellationToken);
+            }
+            else
+            {
+                await sessionStore.SaveAsync(_session, cancellationToken);
+            }
+
+            return;
+        }
+
         if (direction is not null)
         {
-            await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, cancellationToken);
+            await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, false, cancellationToken);
         }
         else
         {
@@ -684,7 +760,7 @@ public sealed class Worker(
         decimal marketPrice,
         CancellationToken cancellationToken)
     {
-        if (_session?.Trade is not TradeState trade || _account is null || _contract is null)
+        if (_session?.Trade is not TradeState trade || _account is null)
         {
             return false;
         }
@@ -700,14 +776,14 @@ public sealed class Worker(
         }
 
         var position = (await topstep.GetOpenPositionsAsync(_account.Id, cancellationToken))
-            .SingleOrDefault(item => item.ContractId == _contract.Id);
+            .SingleOrDefault(item => item.ContractId == trade.ContractId);
         if (position is null || !MatchesTradePosition(position, trade))
         {
             await ClosePositionAsync($"position-mismatch-before-{reason}", cancellationToken);
             return false;
         }
 
-        var existingStops = await GetContractStopOrdersAsync(cancellationToken);
+        var existingStops = await GetContractStopOrdersAsync(trade.ContractId, cancellationToken);
         if (existingStops.Length > 1 ||
             existingStops.Length == 1 &&
             (!MatchesProtectiveStop(existingStops[0], trade) ||
@@ -737,7 +813,7 @@ public sealed class Worker(
             {
                 var response = await topstep.PlaceOrderAsync(
                     _account.Id,
-                    _contract.Id,
+                    trade.ContractId,
                     type: 4,
                     side: trade.Direction == TradeDirection.Long ? 1 : 0,
                     size: trade.Quantity,
@@ -774,14 +850,14 @@ public sealed class Worker(
 
     private async Task<bool> ConfirmStopAsync(TradeState trade, decimal expectedStop, CancellationToken cancellationToken)
     {
-        if (_account is null || _contract is null || trade.StopOrderId is null)
+        if (_account is null || trade.StopOrderId is null)
         {
             return false;
         }
 
         for (var attempt = 0; attempt < 3; attempt++)
         {
-            var stops = await GetContractStopOrdersAsync(cancellationToken);
+            var stops = await GetContractStopOrdersAsync(trade.ContractId, cancellationToken);
             var order = stops.SingleOrDefault();
             if (stops.Length == 1 &&
                 order is not null &&
@@ -801,12 +877,12 @@ public sealed class Worker(
 
     private async Task<bool> ConfirmExistingStopAsync(TradeState trade, CancellationToken cancellationToken)
     {
-        if (_account is null || _contract is null)
+        if (_account is null)
         {
             return false;
         }
 
-        var stops = await GetContractStopOrdersAsync(cancellationToken);
+        var stops = await GetContractStopOrdersAsync(trade.ContractId, cancellationToken);
         var order = stops.SingleOrDefault();
         if (stops.Length != 1 ||
             order is null ||
@@ -842,7 +918,7 @@ public sealed class Worker(
             .ToArray();
         foreach (var contractId in contractIds)
         {
-            if (contractId == _contract.Id)
+            if (_session?.Trade?.ContractId == contractId)
             {
                 await ClosePositionAsync("4pm-et-session-close", cancellationToken);
             }
@@ -877,6 +953,7 @@ public sealed class Worker(
         }
 
         var trade = _session?.Trade;
+        var contractId = trade?.ContractId ?? _session?.PendingEntryContractId ?? _contract.Id;
         var closeSubmitted = false;
         for (var attempt = 0; attempt < 3; attempt++)
         {
@@ -885,7 +962,7 @@ public sealed class Worker(
                 await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
             }
 
-            if (!await IsContractPositionOpenAsync(_contract.Id, cancellationToken))
+            if (!await IsContractPositionOpenAsync(contractId, cancellationToken))
             {
                 await FinalizeManagedPositionCloseAsync(trade, cancellationToken);
                 await journal.WriteAsync(
@@ -898,7 +975,7 @@ public sealed class Worker(
 
             try
             {
-                await topstep.ClosePositionAsync(_account.Id, _contract.Id, cancellationToken);
+                await topstep.ClosePositionAsync(_account.Id, contractId, cancellationToken);
                 closeSubmitted = true;
                 await journal.WriteAsync($"position-close-submitted:{reason}; attempt={attempt + 1}", cancellationToken);
             }
@@ -911,7 +988,7 @@ public sealed class Worker(
         }
 
         await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
-        if (!await IsContractPositionOpenAsync(_contract.Id, cancellationToken))
+        if (!await IsContractPositionOpenAsync(contractId, cancellationToken))
         {
             await FinalizeManagedPositionCloseAsync(trade, cancellationToken);
             await journal.WriteAsync(
@@ -992,11 +1069,64 @@ public sealed class Worker(
         {
             _session.Trade = null;
             _session.PendingEntryDirection = null;
+            _session.PendingEntryOrderId = null;
+            _session.PendingEntryContractId = null;
+            _session.PendingEntryQuantity = null;
+            _session.PendingEntryIsStage6 = false;
             await sessionStore.SaveAsync(_session, cancellationToken);
         }
     }
 
-    private async Task<TopstepOrder[]> GetContractStopOrdersAsync(CancellationToken cancellationToken)
+    private async Task EvaluateStage6EligibilityAsync(TradeState trade, CancellationToken cancellationToken)
+    {
+        if (!options.Value.EnableStage6ReversalTrade ||
+            trade.IsStage6 ||
+            _session is null ||
+            _account is null ||
+            _session.Stage6Submitted ||
+            _session.Stage6Eligible ||
+            trade.EntryOrderId is not long entryOrderId ||
+            trade.StopOrderId is not long stopOrderId)
+        {
+            return;
+        }
+
+        var executions = (await topstep.GetTradesAsync(
+                _account.Id,
+                MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue),
+                DateTimeOffset.UtcNow,
+                cancellationToken))
+            .Where(execution => execution.ContractId == trade.ContractId &&
+                                (execution.OrderId == entryOrderId || execution.OrderId == stopOrderId))
+            .ToArray();
+        var stopExecutions = executions
+            .Where(execution => execution.OrderId == stopOrderId &&
+                                execution.Side == (trade.Direction == TradeDirection.Long ? 1 : 0))
+            .ToArray();
+        if (stopExecutions.Sum(execution => execution.Size) < trade.Quantity)
+        {
+            await journal.WriteAsync("stage6-ineligible:original-close-not-confirmed-protective-stop", cancellationToken);
+            return;
+        }
+
+        var netRealizedProfit = executions.Sum(execution => execution.ProfitAndLoss ?? 0m) -
+                                executions.Sum(execution => execution.Fees);
+        if (netRealizedProfit >= 0)
+        {
+            await journal.WriteAsync($"stage6-ineligible:original-net-profit={netRealizedProfit}", cancellationToken);
+            return;
+        }
+
+        _session.Stage6Eligible = true;
+        _session.Stage6EligibleAt = stopExecutions.Max(execution => execution.CreationTimestamp);
+        _session.Stage6OriginalDirection = trade.Direction;
+        await sessionStore.SaveAsync(_session, cancellationToken);
+        await journal.WriteAsync(
+            $"stage6-eligible:original-direction={trade.Direction}; net-realized-profit={netRealizedProfit}; closed-at={_session.Stage6EligibleAt:O}",
+            cancellationToken);
+    }
+
+    private async Task<TopstepOrder[]> GetContractStopOrdersAsync(string contractId, CancellationToken cancellationToken)
     {
         if (_account is null || _contract is null)
         {
@@ -1004,13 +1134,12 @@ public sealed class Worker(
         }
 
         return (await topstep.GetOpenOrdersAsync(_account.Id, cancellationToken))
-            .Where(order => order.ContractId == _contract.Id && order.Type == 4)
+            .Where(order => order.ContractId == contractId && order.Type == 4)
             .ToArray();
     }
 
     private static bool MatchesTradePosition(TopstepPosition position, TradeState trade) =>
         position.ContractId == trade.ContractId &&
-        trade.Quantity == OrbStrategy.EntryQuantity &&
         position.Size == trade.Quantity &&
         position.Type == (trade.Direction == TradeDirection.Long ? 1 : 2);
 
@@ -1030,7 +1159,7 @@ public sealed class Worker(
 
         var start = MarketTime.ToUtc(_session.TradingDate, TimeOnly.MinValue);
         var executions = (await topstep.GetTradesAsync(_account.Id, start, DateTimeOffset.UtcNow, cancellationToken))
-            .Where(execution => execution.ContractId == _contract.Id)
+            .Where(execution => execution.ContractId == (expectedTrade?.ContractId ?? _contract.Id))
             .OrderBy(execution => execution.CreationTimestamp)
             .ToArray();
         foreach (var execution in executions.Where(execution => !_session.LoggedTradeIds.Contains(execution.Id)))
