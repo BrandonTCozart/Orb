@@ -307,7 +307,7 @@ public sealed class TopstepClient(HttpClient httpClient, IOptions<TopstepOptions
     private static TimeSpan GetRetryAfter(RetryConditionHeaderValue? retryAfterHeader)
     {
         var retryAfter = retryAfterHeader?.Delta ??
-            (retryAfterHeader?.Date is DateTimeOffset retryAt ? retryAt - DateTimeOffset.UtcNow : null) ??
+            (retryAfterHeader?.Date is DateTimeOffset retryAt ? (TimeSpan?)(retryAt - DateTimeOffset.UtcNow) : null) ??
             DefaultRateLimitDelay;
         return retryAfter > TimeSpan.Zero ? retryAfter : MinimumRequestInterval;
     }
