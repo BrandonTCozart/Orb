@@ -701,6 +701,12 @@ public sealed class Worker(
             ? Math.Floor(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize
             : Math.Ceiling(requestedStop / OrbStrategy.TickSize) * OrbStrategy.TickSize;
 
+        if (trade.ConfirmedStop is decimal currentStop &&
+            !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
+        {
+            return true;
+        }
+
         var existingStops = await GetContractStopOrdersAsync(cancellationToken);
         if (existingStops.Length > 1 ||
             existingStops.Length == 1 &&
@@ -714,12 +720,6 @@ public sealed class Worker(
         if (existingStops.Length == 1 && trade.StopOrderId is null)
         {
             trade.StopOrderId = existingStops[0].Id;
-        }
-
-        if (trade.ConfirmedStop is decimal currentStop &&
-            !strategy.IsMoreProtective(trade.Direction, requestedStop, currentStop))
-        {
-            return await ConfirmExistingStopAsync(trade, cancellationToken);
         }
 
         if (!strategy.IsValidProtectiveStop(trade, requestedStop, marketPrice))
