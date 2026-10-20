@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -86,12 +87,15 @@ public sealed class MarketDataFeed(
     : IAsyncDisposable
 {
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, byte> _subscribedContractIds = new();
+    private readonly ConcurrentDictionary<string, Quote> _lastQuotes = new();
     private HubConnection? _connection;
-    private string? _contractId;
     private string? _token;
 
-    public Quote? LastQuote { get; private set; }
-    public event Func<Quote, Task>? QuoteReceived;
+    public event Func<string, Quote, Task>? QuoteReceived;
+
+    public Quote? GetLastQuote(string contractId) =>
+        _lastQuotes.TryGetValue(contractId, out var quote) ? quote : null;
 
     public async Task EnsureStartedAsync(string contractId, CancellationToken cancellationToken)
     {
@@ -99,10 +103,15 @@ public sealed class MarketDataFeed(
         await _connectionLock.WaitAsync(cancellationToken);
         try
         {
+            var addedContract = _subscribedContractIds.TryAdd(contractId, 0);
             if (_connection is { State: HubConnectionState.Connected } &&
-                _contractId == contractId &&
                 _token == token)
             {
+                if (addedContract)
+                {
+                    await _connection.InvokeAsync("SubscribeContractQuotes", contractId, cancellationToken);
+                }
+
                 return;
             }
 
@@ -111,7 +120,6 @@ public sealed class MarketDataFeed(
                 await _connection.DisposeAsync();
             }
 
-            _contractId = contractId;
             _token = token;
             _connection = new HubConnectionBuilder()
                 .WithUrl(options.Value.MarketHubUrl, hubOptions =>
@@ -125,21 +133,24 @@ public sealed class MarketDataFeed(
 
             _connection.On<string, Quote>("GatewayQuote", async (eventContractId, quote) =>
             {
-                if (eventContractId == _contractId && quote.LastPrice > 0)
+                if (_subscribedContractIds.ContainsKey(eventContractId) && quote.LastPrice > 0)
                 {
-                    LastQuote = quote;
+                    _lastQuotes[eventContractId] = quote;
                     var handler = QuoteReceived;
                     if (handler is not null)
                     {
-                        await handler(quote);
+                        await handler(eventContractId, quote);
                     }
                 }
             });
             _connection.Reconnected += async _ =>
             {
-                if (_connection is not null && _contractId is not null)
+                if (_connection is not null)
                 {
-                    await _connection.InvokeAsync("SubscribeContractQuotes", _contractId);
+                    foreach (var subscribedContractId in _subscribedContractIds.Keys)
+                    {
+                        await _connection.InvokeAsync("SubscribeContractQuotes", subscribedContractId);
+                    }
                 }
             };
             _connection.Closed += error =>
@@ -149,7 +160,10 @@ public sealed class MarketDataFeed(
             };
 
             await _connection.StartAsync(cancellationToken);
-            await _connection.InvokeAsync("SubscribeContractQuotes", contractId, cancellationToken);
+            foreach (var subscribedContractId in _subscribedContractIds.Keys)
+            {
+                await _connection.InvokeAsync("SubscribeContractQuotes", subscribedContractId, cancellationToken);
+            }
         }
         finally
         {
