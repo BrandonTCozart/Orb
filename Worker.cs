@@ -542,6 +542,7 @@ public sealed class Worker(
             if (_contract?.Id == contractId)
             {
                 await UpdateLiveCandleAsync(quote, CancellationToken.None);
+                await TrackStage6RangeRevisitAsync(quote, CancellationToken.None);
             }
 
             if (_session?.Trade is TradeState trade &&
@@ -561,6 +562,27 @@ public sealed class Worker(
             _stateLock.Release();
         }
     }
+
+    private async Task TrackStage6RangeRevisitAsync(Quote quote, CancellationToken cancellationToken)
+    {
+        if (_session?.Stage6Eligible != true ||
+            _session.Stage6RangeRevisited ||
+            _openingRange is null ||
+            !IsInsideOpeningRange(quote.LastPrice, _openingRange))
+        {
+            return;
+        }
+
+        _session.Stage6RangeRevisited = true;
+        _session.Stage6RangeRevisitedAt = quote.Timestamp;
+        await sessionStore.SaveAsync(_session, cancellationToken);
+        await journal.WriteAsync(
+            $"stage6-range-revisited:price={quote.LastPrice}; revisited-at={quote.Timestamp:O}",
+            cancellationToken);
+    }
+
+    private static bool IsInsideOpeningRange(decimal price, OpeningRange openingRange) =>
+        price >= openingRange.Low && price <= openingRange.High;
 
     private async Task UpdateLiveCandleAsync(Quote quote, CancellationToken cancellationToken)
     {
@@ -672,6 +694,9 @@ public sealed class Worker(
             if (candleClose < cutoff &&
                 _session.Stage6EligibleAt is DateTimeOffset eligibleAt &&
                 candleClose > MarketTime.ToEastern(eligibleAt) &&
+                _session.Stage6RangeRevisited &&
+                _session.Stage6RangeRevisitedAt is DateTimeOffset revisitedAt &&
+                candleClose > MarketTime.ToEastern(revisitedAt) &&
                 direction is not null)
             {
                 await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, true, cancellationToken);
@@ -1130,12 +1155,18 @@ public sealed class Worker(
             return;
         }
 
+        var closingExecution = stopExecutions.MaxBy(execution => execution.CreationTimestamp)!;
         _session.Stage6Eligible = true;
-        _session.Stage6EligibleAt = stopExecutions.Max(execution => execution.CreationTimestamp);
+        _session.Stage6EligibleAt = closingExecution.CreationTimestamp;
         _session.Stage6OriginalDirection = trade.Direction;
+        _session.Stage6RangeRevisited = _openingRange is not null &&
+                                       IsInsideOpeningRange(closingExecution.Price, _openingRange);
+        _session.Stage6RangeRevisitedAt = _session.Stage6RangeRevisited
+            ? closingExecution.CreationTimestamp
+            : null;
         await sessionStore.SaveAsync(_session, cancellationToken);
         await journal.WriteAsync(
-            $"stage6-eligible:original-direction={trade.Direction}; net-realized-profit={netRealizedProfit}; closed-at={_session.Stage6EligibleAt:O}",
+            $"stage6-eligible:original-direction={trade.Direction}; net-realized-profit={netRealizedProfit}; closed-at={_session.Stage6EligibleAt:O}; range-revisited={_session.Stage6RangeRevisited}",
             cancellationToken);
     }
 

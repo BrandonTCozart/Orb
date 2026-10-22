@@ -197,6 +197,8 @@ public sealed class OrbSessionState
     public bool Stage6Submitted { get; set; }
     public DateTimeOffset? Stage6EligibleAt { get; set; }
     public TradeDirection? Stage6OriginalDirection { get; set; }
+    public bool Stage6RangeRevisited { get; set; }
+    public DateTimeOffset? Stage6RangeRevisitedAt { get; set; }
     public TradeState? Trade { get; set; }
     public List<long> LoggedTradeIds { get; init; } = [];
 }
