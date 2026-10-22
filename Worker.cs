@@ -835,7 +835,7 @@ public sealed class Worker(
                     side: trade.Direction == TradeDirection.Long ? 1 : 0,
                     size: trade.Quantity,
                     stopPrice: requestedStop,
-                    customTag: $"orb-{_session.TradingDate:yyyyMMdd}-stop",
+                    customTag: $"orb-{_session.TradingDate:yyyyMMdd}-{(trade.IsStage6 ? "stage6-stop" : "stop")}",
                     cancellationToken);
                 trade.StopOrderId = response.OrderId;
             }
