@@ -669,19 +669,10 @@ public sealed class Worker(
         {
             var candleClose = MarketTime.ToEastern(candle.T).AddMinutes(1);
             var cutoff = MarketTime.ToEastern(MarketTime.ToUtc(_session.TradingDate, new TimeOnly(13, 0)));
-            if (_session.Stage6OriginalDirection is not TradeDirection originalDirection)
-            {
-                await sessionStore.SaveAsync(_session, cancellationToken);
-                return;
-            }
-
-            var oppositeDirection = originalDirection == TradeDirection.Long
-                ? TradeDirection.Short
-                : TradeDirection.Long;
             if (candleClose < cutoff &&
                 _session.Stage6EligibleAt is DateTimeOffset eligibleAt &&
                 candleClose > MarketTime.ToEastern(eligibleAt) &&
-                direction == oppositeDirection)
+                direction is not null)
             {
                 await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, true, cancellationToken);
             }
