@@ -44,6 +44,28 @@ public sealed class TradeJournal(IOptions<TopstepOptions> options, ILogger<Trade
 
         logger.LogInformation("{JournalMessage}", message);
     }
+
+    public async Task WriteDailyProfitLossAsync(
+        DateOnly tradingDate,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, options.Value.DataDirectory, "logs");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"orb-daily-pnl-{tradingDate:yyyy-MM-dd}.txt");
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await File.WriteAllTextAsync(path, $"{message}{Environment.NewLine}", cancellationToken);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        logger.LogInformation("{DailyProfitLoss}", message);
+    }
 }
 
 public sealed class SessionStore(IOptions<TopstepOptions> options)
