@@ -6,11 +6,14 @@ public sealed class OrbStrategy
     public const decimal TickSize = 0.25m;
     public const decimal MaxInitialRisk = 600m;
     public const decimal DefaultInitialStopRisk = 500m;
-    public const int EntryQuantity = 1;
+    public const int EntryQuantity = 2;
     public const decimal Stage6MaxInitialRisk = 300m;
     public const decimal Stage6DefaultInitialStopRisk = 250m;
     public const int Stage6EntryQuantity = 5;
     public const decimal MesPointValue = 5m;
+
+    // Configuration #1349210: ES stage-5 trailing distance in USD.
+    public decimal EsTrailingDistance { get; set; } = 350m;
 
     public OpeningRange? GetOpeningRange(IEnumerable<Candle> candles, DateOnly tradingDate)
     {
@@ -92,8 +95,8 @@ public sealed class OrbStrategy
     }
 
     public TradeDirection? GetBreakout(Candle candle, OpeningRange openingRange) =>
-        candle.C > openingRange.High ? TradeDirection.Long :
-        candle.C < openingRange.Low ? TradeDirection.Short : null;
+        candle.C > openingRange.High + 1m ? TradeDirection.Long :
+        candle.C < openingRange.Low - 1m ? TradeDirection.Short : null;
 
     public TradeState CreateTrade(
         TradeDirection direction,
@@ -267,7 +270,7 @@ public sealed class OrbStrategy
 
         decimal? desiredProfit = null;
         var continuousTrailThreshold = trade.IsStage6 ? 500m : 1000m;
-        var trailingDistance = trade.IsStage6 ? 125m : 250m;
+        var trailingDistance = trade.IsStage6 ? 125m : EsTrailingDistance;
         if (trade.PeakProfit >= continuousTrailThreshold)
         {
             desiredProfit = trade.PeakProfit - trailingDistance;
