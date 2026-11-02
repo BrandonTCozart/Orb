@@ -8,6 +8,7 @@ builder.Services.AddSingleton<TradeJournal>();
 builder.Services.AddSingleton<SessionStore>();
 builder.Services.AddSingleton<MarketDataFeed>();
 builder.Services.AddSingleton<OrbStrategy>();
+builder.Services.AddSingleton<EconomicReleaseCalendar>();
 builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();
