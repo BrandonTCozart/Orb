@@ -6,6 +6,7 @@ public sealed class Worker(
     TopstepClient topstep,
     MarketDataFeed marketData,
     OrbStrategy strategy,
+    EconomicReleaseCalendar calendar,
     SessionStore sessionStore,
     TradeJournal journal,
     IOptions<TopstepOptions> options,
@@ -67,6 +68,12 @@ public sealed class Worker(
                 _longReferenceLevels = null;
                 _shortReferenceLevels = null;
                 await journal.WriteAsync($"trading-date:{tradingDate:yyyy-MM-dd}", cancellationToken);
+                calendar.Reload();
+                await journal.WriteAsync(calendar.CoverageNotice(tradingDate), cancellationToken);
+                if (calendar.NoEntryReason(tradingDate) is string blockedToday)
+                    await journal.WriteAsync("new-entries-disabled:" + blockedToday, cancellationToken);
+                else if (!IsConfiguredTradingDay(tradingDate))
+                    await journal.WriteAsync("new-entries-disabled:weekday-not-selected-by-config-1349210", cancellationToken);
             }
 
             _account ??= await topstep.GetTradingAccountAsync(cancellationToken);
@@ -276,6 +283,14 @@ public sealed class Worker(
         bool isStage6,
         CancellationToken cancellationToken)
     {
+        // Configuration #1349210 only permits new ES entries on selected
+        // weekdays before 11:00 ET, and never on major-release days.
+        if (!IsConfiguredTradingDay(tradingDate) ||
+            calendar.NoEntryReason(tradingDate) is not null ||
+            MarketTime.ToEastern(breakoutCandle.T).TimeOfDay.Add(TimeSpan.FromMinutes(1)) >
+                new TimeSpan(11, 0, 0))
+            return;
+
         var entryContract = isStage6 ? _mesContract : _contract;
         var quantity = isStage6 ? OrbStrategy.Stage6EntryQuantity : OrbStrategy.EntryQuantity;
         if (_session is null || entryContract is null || _account is null || _openingRange is null)
@@ -678,6 +693,12 @@ public sealed class Worker(
             return;
         }
 
+        if (!IsConfiguredTradingDay(_session.TradingDate) ||
+            calendar.NoEntryReason(_session.TradingDate) is not null ||
+            MarketTime.ToEastern(candle.T).TimeOfDay.Add(TimeSpan.FromMinutes(1)) >
+                new TimeSpan(11, 0, 0))
+            return;
+
         _session.LastEntryCandle = candle.T;
         if (easternNow - MarketTime.ToEastern(candle.T) > TimeSpan.FromMinutes(2))
         {
@@ -709,7 +730,8 @@ public sealed class Worker(
             return;
         }
 
-        if (direction is not null)
+        if (direction is not null &&
+            await MeetsVolumeThresholdAsync(candle, direction.Value, cancellationToken))
         {
             await SubmitEntryAsync(direction.Value, candle, _session.TradingDate, false, cancellationToken);
         }
@@ -717,6 +739,62 @@ public sealed class Worker(
         {
             await sessionStore.SaveAsync(_session, cancellationToken);
         }
+    }
+
+    private static bool IsConfiguredTradingDay(DateOnly day) =>
+        day.DayOfWeek is DayOfWeek.Monday or DayOfWeek.Tuesday or
+            DayOfWeek.Wednesday or DayOfWeek.Friday;
+
+    // The quote-built candles have V=0. Read the API's completed 1-minute
+    // bars for a candidate signal and compare its actual volume against the
+    // previous ten regular-session minutes, exactly as in the optimizer.
+    private async Task<bool> MeetsVolumeThresholdAsync(
+        Candle breakoutCandle, TradeDirection direction, CancellationToken cancellationToken)
+    {
+        if (_contract is null || _openingRange is null || _session is null)
+            return false;
+
+        var from = MarketTime.ToUtc(_session.TradingDate, new TimeOnly(9, 30));
+        var to = breakoutCandle.T.AddMinutes(1);
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var actual = await topstep.GetMinuteBarsAsync(_contract.Id, from, to, cancellationToken);
+            var signal = actual.SingleOrDefault(bar => bar.T == breakoutCandle.T);
+            if (signal is null)
+            {
+                if (attempt < 2)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(400), cancellationToken);
+                    continue;
+                }
+
+                await journal.WriteAsync(
+                    $"entry-skipped:completed-signal-volume-unavailable; candle={breakoutCandle.T:O}",
+                    cancellationToken);
+                return false;
+            }
+
+            var prior = actual.Where(bar => bar.T < signal.T)
+                .OrderByDescending(bar => bar.T).Take(10).ToArray();
+            if (prior.Length != 10 ||
+                strategy.GetBreakout(signal, _openingRange) != direction)
+            {
+                await journal.WriteAsync(
+                    $"entry-skipped:historical-breakout-or-volume-history-mismatch; candle={signal.T:O}",
+                    cancellationToken);
+                return false;
+            }
+
+            var average = prior.Sum(bar => Math.Max(0L, bar.V)) / 10m;
+            var accepted = average > 0m && signal.V >= average * 1.25m;
+            if (!accepted)
+                await journal.WriteAsync(
+                    $"entry-skipped:volume-filter; volume={signal.V}; prior-10-average={average:0.##}; required-multiple=1.25",
+                    cancellationToken);
+            return accepted;
+        }
+
+        return false;
     }
 
     private static Candle CreateLiveCandle(DateTimeOffset timestamp, decimal price) =>
